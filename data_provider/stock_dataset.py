@@ -120,7 +120,18 @@ class StockDataset(Dataset):
             else:
                 di_range = range(t2, T - _horizon)
 
-        print(f"[StockDataset] {flag}: {len(di_range)} dates, {S} stocks, {F} features")
+        if len(di_range) > 0:
+            dates_pd_all = _pd.to_datetime(dates) if not use_date_split else dates_pd
+            d0 = dates_pd_all[di_range[0]]  if not isinstance(di_range, range) else dates_pd_all[di_range[0]]
+            d1 = dates_pd_all[di_range[-1]] if not isinstance(di_range, range) else dates_pd_all[di_range[-1]]
+            d0_label_end = dates_pd_all[min(di_range[0]  + _horizon, T-1)]
+            d1_label_end = dates_pd_all[min(di_range[-1] + _horizon, T-1)]
+            print(f"[StockDataset] {flag}: {len(di_range)} dates  "
+                  f"signal=[{d0.date()} ~ {d1.date()}]  "
+                  f"label_end=[{d0_label_end.date()} ~ {d1_label_end.date()}]")
+        else:
+            print(f"[StockDataset] {flag}: 0 dates")
+        print(f"[StockDataset] {flag}: {S} stocks, {F} features")
 
         # ── 构建样本索引（向量化，快速）───────────────────────────────────────
         print("[StockDataset] Building sample index...")
@@ -177,24 +188,10 @@ class StockDataset(Dataset):
 
 
 def stock_collate_fn(batch):
-    """DayBatchSampler 保证一个 batch = 一整天，直接在全截面上做 rank 归一化。
-    返回 (x, y_norm) — di 不再需要向外暴露，训练时全局 Pearson = 当日 IC。"""
+    """stack 即可，rank 归一化已在 build_label_lib.py 离线完成（全 universe 截面）。
+    返回 (x, y)，y shape = (B, 1)。"""
     xs, ys, _ = zip(*batch)
-    xs = torch.stack(xs)
-    ys = torch.stack(ys)
-
-    n = len(ys)
-    if n >= 2:
-        # argsort().argsort() 对 ties 不稳定；改用 scipy 的 average 方法
-        import scipy.stats as _ss
-        ranks = torch.tensor(
-            _ss.rankdata(ys.numpy(), method="average"), dtype=torch.float32
-        )
-        ys_norm = (ranks - 1) / (n - 1) * 2 - 1   # → [-1, 1]
-    else:
-        ys_norm = ys.clone()
-
-    return xs, ys_norm.unsqueeze(-1)
+    return torch.stack(xs), torch.stack(ys).unsqueeze(-1)
 
 
 class DayBatchSampler(Sampler):
