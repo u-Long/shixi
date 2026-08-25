@@ -10,10 +10,9 @@
 
 ```
 iTransformer/
-├── run_stock.py              # 训练入口
-├── backtest.py               # 回测（TopKDrop，双 drop 对比）
-├── build_cache.py            # 构建 numpy 缓存（特征+label）
-├── select_factors.py         # Alpha191 因子筛选
+├── scripts/
+│   ├── run_stock.py          # 训练入口
+│   └── backtest.py           # 回测（TopKDrop，baseline + custom 对比）
 │
 ├── model/
 │   └── iTransformer_stock.py # 改造版模型：(B,T,F) → (B,1)
@@ -43,12 +42,14 @@ iTransformer/
 │   │   └── cache_fea2_hs300_ret5do/     # HS300 + fea2 + ret_5d_open
 │   │
 │   └── scripts/              # 一次性数据构建脚本
-│       ├── build_feature_lib.py
-│       ├── build_label_lib.py
-│       └── compute_fea3_fullmkt.py
+│       ├── build_feature_lib.py  # 构建 fea1/fea2/fea3 parquet
+│       ├── build_label_lib.py    # 构建 label_lib.parquet
+│       ├── build_cache.py        # 构建 numpy 缓存
+│       ├── compute_fea3_fullmkt.py
+│       └── select_factors.py     # Alpha191 因子筛选
 │
 ├── checkpoints/              # 模型检查点
-├── backtest_results/         # 回测结果（图表 + CSV）
+├── backtest_results/         # 回测结果（图表 + CSV + summary.md）
 └── logs/                     # 训练日志
 ```
 
@@ -74,7 +75,32 @@ MLP Head                (B, 1)           — 预测未来收益率
 
 ## 快速开始
 
-### 1. 构建缓存
+### 1. 构建特征库（一次性）
+
+```bash
+# 构建 fea1 / fea2（基础价格+量价估值）
+python data/scripts/build_feature_lib.py --fea 1 2
+
+# 构建 label 库
+python data/scripts/build_label_lib.py
+
+# 构建 fea3（Alpha191，依赖 Qlib）—— 可选
+python data/scripts/compute_fea3_fullmkt.py
+
+# Alpha191 因子筛选（输出 data/selected_factors.txt）—— 构建 fea3 后运行
+python data/scripts/select_factors.py
+```
+
+输出目录 `data/feature_lib/`：
+
+| 文件 | 说明 |
+|------|------|
+| `fea1_price_basic.parquet` | 基础价格特征（截面 z-score） |
+| `fea2_price_new.parquet` | 量价+估值+资金流，39 维 |
+| `fea3_alpha191.parquet` | 筛选后的 Alpha191 因子，20 维 |
+| `label_lib.parquet` | 多种收益率标签（ret_5d_open 等） |
+
+### 2. 构建 numpy 缓存
 
 ```bash
 # HS300 + fea2 + 5日开开收益
@@ -92,7 +118,7 @@ python data/scripts/build_cache.py --fea fea2 --label ret_5d_open --universe all
 - `universe_mask.npy`：`(T, S)` 点时间成分股掩码（非全市场时）
 - `meta.json`：构建参数记录
 
-### 2. 训练
+### 4. 训练
 
 ```bash
 nohup python scripts/run_stock.py \
@@ -124,7 +150,7 @@ nohup python scripts/run_stock.py \
 | `--ic_weight` | 10 | combined loss 中 IC 项权重 |
 | `--class_strategy` | `mean` | `mean`（均值池化）/ `cls_token` |
 
-### 3. 回测
+### 5. 回测
 
 ```bash
 nohup python scripts/backtest.py \
@@ -146,16 +172,16 @@ baseline（topk=30 drop=3）每次都自动运行，`--topk/--n_drop` 指定 cus
 ```
 panel.parquet（BaoStock原始数据）
     ↓
-data/scripts/build_feature_lib.py   →  data/feature_lib/*.parquet
+data/scripts/build_feature_lib.py   →  data/feature_lib/fea{1,2,3}_*.parquet
 data/scripts/build_label_lib.py     →  data/feature_lib/label_lib.parquet
     ↓
-select_factors.py                   →  data/selected_factors.txt（Alpha191筛选）
+data/scripts/select_factors.py      →  data/selected_factors.txt（Alpha191筛选，fea3依赖）
     ↓
-build_cache.py                      →  data/cache/cache_*/（numpy缓存）
+data/scripts/build_cache.py         →  data/cache/cache_*/（numpy缓存）
     ↓
-run_stock.py                        →  checkpoints/*/best.pt
+scripts/run_stock.py                →  checkpoints/*/best.pt
     ↓
-backtest.py                         →  backtest_results/*/
+scripts/backtest.py                 →  backtest_results/*/{backtest.png,exec_metrics.csv,summary.md}
 ```
 
 ---
