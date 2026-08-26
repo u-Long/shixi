@@ -23,6 +23,7 @@ parser.add_argument("--fea", nargs="+", type=int, default=[1, 2, 3], help="构�
 parser.add_argument("--start_date", default="2015-01-01")
 parser.add_argument("--end_date",   default="2026-08-20")
 parser.add_argument("--out_dir",    default="data/feature_lib")
+parser.add_argument("--fea2_name",  default=None, help="fea2 输出文件名（不含路径），默认 fea2_price_new.parquet")
 parser.add_argument("--panel_path", default="/root/dmd/BaoStock/panel.parquet")
 parser.add_argument("--qlib_uri",   default="/root/dmd/BaoStock/qlib_fullmkt")
 parser.add_argument("--factor_list",default="data/selected_factors.txt")
@@ -163,7 +164,7 @@ def build_fea2(panel):
         f = pd.DataFrame(index=g.index)
 
         # open: 相对5日前 open 的变化（data_utils 原始逻辑）
-        f["open"]     = open_ / open_.shift(5).bfill() - 1
+        f["open"]     = open_ / open_.shift(5).ffill() - 1
         f["pct_chg"]  = (close / pre_close - 1).clip(-0.3, 0.3)
 
         # 价格特征均相对当日 open 归一化
@@ -176,7 +177,7 @@ def build_fea2(panel):
 
         # 量和金额：除以10日滚动标准差
         for col, s in [("vol", volume), ("amount", amount)]:
-            std = s.rolling(10).std().bfill().clip(lower=1e-8)
+            std = s.rolling(10).std().ffill().clip(lower=1e-8)
             f[col] = s / std
 
         # 换手率直接保留
@@ -224,11 +225,11 @@ def build_fea2(panel):
         for col in mf_cols:
             s = np.log(mf_df[col].clip(lower=0) + 1)
             std = s.groupby(level="instrument").transform(
-                lambda x: x.rolling(10).std().bfill().clip(lower=1e-8)
+                lambda x: x.rolling(10).std().ffill().clip(lower=1e-8)
             )
             feat[col] = (s / std).reindex(feat.index)
 
-    # data_utils.py 口径：clip + fillna(0)，不做截面 z-score
+    # clip 去极值（含估值差分三列，防止 PE/PB 翻转时产生极端值）
     clip_dict = {
         "open": (-0.2, 0.2), "pct_chg": (-0.2, 0.2),
         "high": (-0.2, 0.2), "low": (-0.2, 0.2),
@@ -238,6 +239,7 @@ def build_fea2(panel):
         "vol": (0, 10), "amount": (0, 10), "turnover_rate": (0, 20),
         "ret_5d": (-0.5, 0.5), "ret_20d": (-0.5, 0.5),
         "amplitude": (0, 0.4), "vol_ratio_20": (0, 10),
+        "peTTM_diff": (-30, 30), "pbMRQ_diff": (-5, 5), "psTTM_diff": (-10, 10),
         "buy_sm_vol": (0, 100), "buy_sm_amount": (0, 100),
         "sell_sm_vol": (0, 100), "sell_sm_amount": (0, 100),
         "buy_md_vol": (0, 70), "buy_md_amount": (0, 70),
@@ -254,7 +256,12 @@ def build_fea2(panel):
             feat[col] = feat[col].clip(lower=lo, upper=hi)
     feat = feat.fillna(0)
 
-    out = os.path.join(args.out_dir, "fea2_price_new.parquet")
+    # 截面 z-score：每日在全截面标准化，对齐模型输入期望（与 fea1/fea3 口径一致）
+    feat = cs_zscore(feat)
+    feat = feat.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    fname = args.fea2_name if args.fea2_name else "fea2_price_new.parquet"
+    out = os.path.join(args.out_dir, fname)
     feat.to_parquet(out)
     print(f"fea2 saved: {feat.shape} -> {out}")
     print(f"  cols ({len(feat.columns)}): {feat.columns.tolist()}")

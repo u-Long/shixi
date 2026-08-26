@@ -2,8 +2,8 @@
 股票收益率预测训练入口
 用法:
   nohup python scripts/run_stock.py \
-    --cache_dir data/cache/cache_fea2_hs300_ret5do \
-    --loss combined --ic_weight 10 \
+    --cache_dir data/cache/cache_fea2_ret5do_0826 \
+    --loss combined --ic_weight 0.05 \
     --ckpt_dir checkpoints/my_run \
     > logs/my_run.log 2>&1 &
 """
@@ -34,7 +34,7 @@ parser = argparse.ArgumentParser()
 # 数据
 parser.add_argument("--cache_dir",        default="data/cache/cache_fea2_ret5do")
 parser.add_argument("--seq_len",   type=int, default=30)
-parser.add_argument("--horizon",   type=int, default=10)
+parser.add_argument("--horizon",   type=int, default=5)
 # 绝对日期划分（推荐）
 parser.add_argument("--train_start", default="2018-04-24")
 parser.add_argument("--train_end",   default="2024-04-23")
@@ -66,7 +66,7 @@ parser.add_argument("--batch_size",    type=int,   default=512)
 parser.add_argument("--lr",            type=float, default=1e-4)
 parser.add_argument("--patience",      type=int,   default=5)
 parser.add_argument("--num_workers",   type=int,   default=4)
-parser.add_argument("--loss",          default="mse",  help="mse / rankic / combined")
+parser.add_argument("--loss",          default="combined",  help="mse / rankic / combined")
 parser.add_argument("--ic_weight",    type=float, default=0.05,
                     help="combined loss 的 IC 项权重，需按 label 量纲校准：\n"
                          "  raw ret_5d_open (std≈0.04): MSE~0.003, |IC|~0.05 → ic_weight≈0.05\n"
@@ -75,6 +75,15 @@ parser.add_argument("--ckpt_dir",      default="checkpoints/stock")
 
 args = parser.parse_args()
 os.makedirs(args.ckpt_dir, exist_ok=True)
+
+# 训练开始时立即保存运行配置，方便事后溯源
+import json
+_config = {
+    "args": vars(args),
+    "cmd": "python " + " ".join(sys.argv),
+}
+with open(os.path.join(args.ckpt_dir, "config.json"), "w") as _f:
+    json.dump(_config, _f, indent=2, ensure_ascii=False)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
@@ -139,18 +148,18 @@ def compute_loss(pred, target, mode: str, ic_weight: float) -> torch.Tensor:
     三种 loss 及推荐搭配的 label（通过 --label 指定，对应 build_label_lib.py 中的列）：
 
       mse      — MSELoss(pred, target)
-                 label 推荐: ret_10d_log（原始对数收益）或 ret_10d_cs_rank_sym
+                 label 推荐: ret_5d_open（原始收益）
                  直接优化预测误差，对极端值敏感，早期收敛最稳定
 
       rankic   — −Pearson(pred, target)
-                 label 必须用: ret_10d_cs_rank_sym（离线全截面 rank，[-1,1]）
-                 此时 Pearson ≈ Spearman RankIC，loss 与评估指标完全对齐
-                 注意：训练早期 pred 方差小时梯度不稳，可先用 mse 预热几个 epoch
+                 label 推荐: ret_5d_open（原始收益），此时 Pearson = IC
+                 若用 ret_5d_open_cs_rank [0,1]，Pearson ≈ Spearman RankIC
+                 注意：训练早期 pred 方差小时梯度不稳，建议配合 mse 使用（combined）
 
       combined — MSELoss + ic_weight × (−Pearson)
-                 label 必须用: ret_10d_cs_rank_sym
-                 target∈[-1,1] 时 MSE~1.0、|Pearson|~0.1，ic_weight=10 使两项量级相当
-                 MSE 稳住早期梯度，Pearson 项引导排序质量，两者互补
+                 label 推荐: ret_5d_open（raw, std≈0.04）
+                 此时 MSE~0.003，|IC|~0.05，ic_weight≈0.05 使两项量级相当
+                 label 改用 ret_5d_open_cs_rank [0,1] 时 MSE~0.08，ic_weight 需重新校准至~1
     """
     if mode == "rankic":
         return neg_pearson(pred, target)
@@ -188,6 +197,7 @@ def evaluate(loader):
     rankic_arr = np.array(daily_rankic)
 
     ic      = float(np.mean(ic_arr))     if len(ic_arr) > 0     else float("nan")
+    # 5日重叠 label 逐日算 IC 序列高度自相关，ICIR = mean/std 会高估约 √horizon 倍，仅供趋势参考
     icir    = float(np.mean(ic_arr)    / (np.std(ic_arr)    + 1e-8)) if len(ic_arr) > 1     else float("nan")
     rankic  = float(np.mean(rankic_arr)) if len(rankic_arr) > 0 else float("nan")
     rankicir= float(np.mean(rankic_arr) / (np.std(rankic_arr) + 1e-8)) if len(rankic_arr) > 1 else float("nan")
@@ -206,10 +216,12 @@ for epoch in range(1, args.epochs + 1):
     for step, (x, y) in enumerate(train_loader):
         if epoch == 1 and step == 0:
             print(f"\n[Batch info] x={tuple(x.shape)}  y={tuple(y.shape)}")
-            print(f"  x: (B=当天有效股票数, T={x.shape[1]}=seq_len, F={x.shape[2]}=特征数)")
-            print(f"  y: (B, 1)  每个样本是一只股票当天的 label")
-            print(f"  DayBatchSampler: batch_size 不固定，等于当天通过过滤的股票数")
-            print(f"  train 共 {len(train_loader)} 天（batches），val {len(val_loader)} 天\n")
+            print(f"  当前为纯时序模式：输入 (B, T, F)，B = 截面股票数 N（batchsize=N 的特殊情况）")
+            print(f"  x: (N={x.shape[0]}=当天有效股票数, T={x.shape[1]}=seq_len, F={x.shape[2]}=特征数)")
+            print(f"  y: (N, 1)  IC loss 在 N 上计算截面相关")
+            print(f"  DayBatchSampler: 一个 batch = 一整天完整截面，保证 IC loss 有效")
+            print(f"  NOTE: 扩展为 STGNN 时输入变为 (B, N, T, F)，N 固定、pad 对齐")
+            print(f"  train 共 {len(train_loader)} 个截面（天），val {len(val_loader)} 个\n")
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
         out  = model(x)

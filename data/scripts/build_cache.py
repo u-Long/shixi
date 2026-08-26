@@ -57,6 +57,8 @@ parser.add_argument("--fea_dir",    default="data/feature_lib")
 parser.add_argument("--panel_path", default="/root/dmd/BaoStock/panel.parquet")
 parser.add_argument("--tag",        default=None,
                     help="缓存目录后缀，默认自动生成 fea1_fea2_hs300_ret10d")
+parser.add_argument("--fea2_file",  default=None,
+                    help="覆盖 fea2 的 parquet 文件名（如 fea2_price_new_0826.parquet），默认 fea2_price_new.parquet")
 args = parser.parse_args()
 
 # 自动生成 tag（含 universe，全市场时省略）
@@ -77,7 +79,7 @@ end   = pd.Timestamp(args.end_date)
 # ── 加载并拼合特征 ────────────────────────────────────────────────────────────
 fea_name_map = {
     "fea1": "fea1_price_basic.parquet",
-    "fea2": "fea2_price_new.parquet",
+    "fea2": args.fea2_file if args.fea2_file else "fea2_price_new.parquet",
     "fea3": "fea3_alpha191.parquet",
 }
 
@@ -98,7 +100,19 @@ for fea in args.fea:
 if not feat_dfs:
     raise RuntimeError("No feature files loaded. Run build_feature_lib.py first.")
 
-feat_df = feat_dfs[0] if len(feat_dfs) == 1 else feat_dfs[0].join(feat_dfs[1:], how="outer")
+if len(feat_dfs) == 1:
+    feat_df = feat_dfs[0]
+else:
+    # 多特征集拼合：重名列加特征集前缀避免 join 报错（如 fea1/fea2 共有 ret_5d）
+    labeled = []
+    for fea_name, df in zip(args.fea, feat_dfs):
+        dup = set(df.columns)
+        for prev_df in labeled:
+            dup &= set(prev_df.columns)
+        if dup:
+            df = df.rename(columns={c: f"{fea_name}_{c}" for c in dup})
+        labeled.append(df)
+    feat_df = labeled[0].join(labeled[1:], how="outer")
 # 过滤日期
 mask = (feat_df.index.get_level_values("datetime") >= start) & \
        (feat_df.index.get_level_values("datetime") <= end)
@@ -165,14 +179,27 @@ if args.universe != "all":
     else:
         panel_for_univ = None  # hs300/zz2000 只需要 weight CSV，不用 panel
 
-    # 取全量 universe 中曾经出现过的股票，用于缩减 S 维度
-    ever_in_univ = set(
-        get_universe_stocks(args.universe, panel_for_univ or pd.DataFrame(),
-                            date=None, custom_path=args.custom_path)
-        if panel_for_univ is not None
-        else get_universe_stocks(args.universe, pd.DataFrame(),
-                                 date=None, custom_path=args.custom_path)
-    )
+    # 取全量 universe 中曾经出现过的股票，用于缩减 S 维度。
+    # zz500/zz1000/zz800：需要逐月快照求并集（而非只取最后一天），避免生存偏差。
+    # hs300/zz2000：走 weight CSV 并集，不需要 panel。
+    if panel_for_univ is not None:
+        # 按月遍历所有快照，取并集
+        all_months = sorted({d.to_period("M") for d in all_dates})
+        ever_in_univ = set()
+        for m in all_months:
+            snap = str(m.to_timestamp(how="E").date())
+            try:
+                members = get_universe_stocks(
+                    args.universe, panel_for_univ, date=snap, custom_path=args.custom_path
+                )
+                ever_in_univ.update(members)
+            except Exception:
+                pass
+    else:
+        ever_in_univ = set(
+            get_universe_stocks(args.universe, pd.DataFrame(),
+                                date=None, custom_path=args.custom_path)
+        )
     all_stocks = sorted(set(candidate_stocks) & ever_in_univ)
     print(f"  Candidate -> {len(candidate_stocks)}, after universe filter -> {len(all_stocks)}")
 

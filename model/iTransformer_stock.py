@@ -65,8 +65,13 @@ class Model(nn.Module):
 
     def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, mask=None):
         """
-        x_enc: (B, T, F)   T=seq_len, F=num_features
-        returns: (B, 1)    预测的未来收益率
+        纯时序模式：x_enc (B, T, F)，B = 截面股票数 N（batchsize=N 的特殊情况）
+        F = 因子数，attention 作用在 F 维度（variate-level），股票间互相独立
+        returns: (B, 1)
+
+        扩展为 STGNN 时：输入改为 (B, N, T, F)，forward 内部
+          reshape (B*N, T, F) → Transformer → reshape (B, N, 1)
+        图结构在 N 维度上定义，接在 reshape 之后、head 之前
         """
         # (B, T, F) -> (B, F, d_model)
         enc_out = self.enc_embedding(x_enc, x_mark_enc)

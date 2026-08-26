@@ -122,14 +122,9 @@ python data/scripts/build_cache.py --fea fea2 --label ret_5d_open --universe all
 
 ```bash
 nohup python scripts/run_stock.py \
-  --cache_dir data/cache/cache_fea2_hs300_ret5do \
+  --cache_dir data/cache/cache_fea2_ret5do_new \
   --seq_len 30 --horizon 5 \
-  --d_model 256 --n_heads 4 --e_layers 2 --d_ff 512 \
-  --epochs 20 --lr 1e-4 \
-  --loss combined --ic_weight 10 \
-  --train_start 2018-04-24 --train_end 2024-04-23 \
-  --val_start   2024-04-24 --val_end   2025-04-23 \
-  --test_start  2025-04-24 --test_end  2026-08-14 \
+  --loss combined --ic_weight 0.05 \
   --ckpt_dir checkpoints/my_run \
   > logs/my_run.log 2>&1 &
 ```
@@ -155,8 +150,7 @@ nohup python scripts/run_stock.py \
 ```bash
 nohup python scripts/backtest.py \
   --ckpt checkpoints/my_run/best.pt \
-  --cache_dir data/cache/cache_fea2_hs300_ret5do \
-  --topk 30 --n_drop 6 \
+  --cache_dir data/cache/cache_fea2_ret5do_new \
   --out_dir backtest_results/my_run \
   > logs/backtest_my_run.log 2>&1 &
 ```

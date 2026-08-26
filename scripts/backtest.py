@@ -169,6 +169,11 @@ dates   = test_ds.dates
 stocks  = test_ds.stocks
 assert len(all_pred) == len(samples)
 
+# 注意：samples 由 StockDataset 构建，过滤条件包含"label 非 NaN"。
+# 这对训练/评估是合理的，但回测候选池若只含 label 有效的股票，
+# 会因为停牌/退市前的股票被静默剔除而产生前视选择偏差（P1.4）。
+# 当前实现中，buyable 过滤已处理涨停/停牌/ST，一定程度上缓解了这个问题；
+# 但理论上正确的做法是独立构建候选池（仅用 T 日已知信息）。
 df = pd.DataFrame([
     {"date": dates[di], "stock": stocks[si], "pred": all_pred[i], "label": all_label[i]}
     for i, (di, si) in enumerate(samples)
@@ -250,11 +255,18 @@ mean_rankic = ic_df["rankic"].mean()
 icir        = mean_ic     / (ic_df["ic"].std()     + 1e-8)
 rankicir    = mean_rankic / (ic_df["rankic"].std() + 1e-8)
 ic_pos      = (ic_df["rankic"] > 0).mean()
+# 5日重叠 label 逐日算 IC，IC 序列高度自相关，mean/std 会系统性高估 ICIR 约 √5 倍。
+# 下面同时报告每5日不重叠采样的 ICIR 作为保守估计。
+ic_df_nooverlap = ic_df.iloc[::HORIZON]
+icir_nooverlap     = float(ic_df_nooverlap["ic"].mean()     / (ic_df_nooverlap["ic"].std()     + 1e-8))
+rankicir_nooverlap = float(ic_df_nooverlap["rankic"].mean() / (ic_df_nooverlap["rankic"].std() + 1e-8))
 ic_df.to_csv(os.path.join(args.out_dir, "ic_series.csv"))
 
 print(f"\n== IC 统计（因子层，基于模型 label）==")
-print(f"  IC={mean_ic:.4f}  ICIR={icir:.4f}  "
-      f"RankIC={mean_rankic:.4f}  RankICIR={rankicir:.4f}  RankIC>0={ic_pos:.2%}")
+print(f"  IC={mean_ic:.4f}  ICIR={icir:.4f}（含重叠高估~√{HORIZON}）  "
+      f"ICIR_nooverlap={icir_nooverlap:.4f}")
+print(f"  RankIC={mean_rankic:.4f}  RankICIR={rankicir:.4f}（含重叠）  "
+      f"RankICIR_nooverlap={rankicir_nooverlap:.4f}  RankIC>0={ic_pos:.2%}")
 
 
 # ══════════════════════════════════════════════════════════════════════════

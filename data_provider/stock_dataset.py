@@ -93,8 +93,10 @@ class StockDataset(Dataset):
                 "val":   (_pd.Timestamp(val_start),   _pd.Timestamp(val_end)),
                 "test":  (_pd.Timestamp(test_start),  _pd.Timestamp(test_end)),
             }
-            # embargo: 每段最后一个样本的 label 结束日期必须严格早于下一段起始日期，
-            # 防止 train/val label 时间窗口重叠（10日 label 与相邻段共享 9 天区间）
+            # embargo: 每段最后一个样本的 label 结束日期必须严格早于下一段起始日期。
+            # ret_X_open label 实际使用 open[i+horizon+1]（T+1 开盘买，T+horizon+1 开盘卖），
+            # 因此 embargo 判断需用 horizon+1 而非 horizon，避免最后一个样本 label 跨入下段。
+            _emb_span = _horizon + 1  # open 系列 label 的实际 span
             embargo_end = {
                 "train": _pd.Timestamp(val_start)  if val_start  else None,
                 "val":   _pd.Timestamp(test_start) if test_start else None,
@@ -107,7 +109,7 @@ class StockDataset(Dataset):
                 if lo <= d <= hi
                 and i >= seq_len - 1
                 and i + _horizon < T
-                and (emb is None or dates_pd[i + _horizon] < emb)
+                and (emb is None or dates_pd[min(i + _emb_span, T - 1)] < emb)
             ]
         else:
             t1 = int(T * train_ratio)

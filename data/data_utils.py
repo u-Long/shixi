@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import tushare as ts
 import datetime
 import time
 import random
@@ -13,7 +12,22 @@ import torch
 # from jqdatasdk import *
 # auth('','')
 
-ts_pro = ts.pro_api("")
+# ts_pro 延迟初始化，避免 import 时触发 tushare 空 token 请求
+_ts_pro = None
+
+def _get_ts_pro():
+    global _ts_pro
+    if _ts_pro is None:
+        import tushare as ts
+        _ts_pro = ts.pro_api("")
+    return _ts_pro
+
+# 兼容旧代码直接用 ts_pro 的地方，在模块加载时不再执行网络请求
+class _LazyTsPro:
+    def __getattr__(self, name):
+        return getattr(_get_ts_pro(), name)
+
+ts_pro = _LazyTsPro()
 
 # 特征截断dict
 clip_dict = {
