@@ -86,6 +86,13 @@ parser.add_argument("--capital",     type=float, default=10_000_000.0)
 parser.add_argument("--buy_cost",    type=float, default=0.0012)
 parser.add_argument("--sell_cost",   type=float, default=0.0017)
 parser.add_argument("--min_cost",    type=float, default=5.0)
+parser.add_argument("--slippage_bps", type=float, default=0.0,
+                    help="单边滑点（bps），叠加在 buy_cost/sell_cost 之上。"
+                         "默认 0 只为保持与历史结果可比；以 T+1 开盘价全额成交本身就很乐观，"
+                         "小盘股实盘单边 20~50bps 是常态，评估真实收益时务必设非 0 值")
+parser.add_argument("--weight_mode", default="drift", choices=["drift", "equal"],
+                    help="drift（默认，正确口径）：持仓权重随收益自然漂移，只对实际换仓收费；"
+                         "equal（旧口径）：每日强制拉回等权，相当于免费日频再平衡，会高估收益")
 parser.add_argument("--n_groups",    type=int,   default=5)
 parser.add_argument("--benchmark",   default="/root/dmd/BaoStock/Index/sh.000001.csv")
 parser.add_argument("--out_dir",     default="backtest_results")
@@ -111,9 +118,20 @@ if isinstance(raw_ckpt, dict) and "args" in raw_ckpt:
 
 HORIZON = args.horizon
 CAP     = args.capital
-BUY_C   = args.buy_cost
-SELL_C  = args.sell_cost
+SLIP    = args.slippage_bps / 1e4
+BUY_C   = args.buy_cost  + SLIP
+SELL_C  = args.sell_cost + SLIP
 MIN_C   = args.min_cost
+WMODE   = args.weight_mode
+
+print(f"成本：买 {BUY_C*1e4:.1f}bps / 卖 {SELL_C*1e4:.1f}bps"
+      f"（含滑点 {args.slippage_bps:.1f}bps 单边）  权重口径：{WMODE}")
+if args.slippage_bps == 0:
+    print("  [WARN] 滑点为 0，且假设 T+1 开盘价全额成交，净收益偏乐观。"
+          "评估真实可实现收益请加 --slippage_bps 20 之类的设定")
+if WMODE == "equal":
+    print("  [WARN] weight_mode=equal 等于每日免费再平衡回等权，"
+          "对波动大的小盘股会白拿再平衡收益，仅用于和旧结果对比")
 
 # baseline 永远是 topk=30 drop=3；custom 仅在 --topk/--n_drop 任一传入时启用
 BASELINE_TOPK = 30
@@ -130,8 +148,10 @@ else:
 
 # ── 加载数据集 ────────────────────────────────────────────────────────────
 def raw_collate(batch):
-    xs, ys, _ = zip(*batch)
-    return torch.stack(xs), torch.stack(ys).unsqueeze(-1)
+    """回测需要 (di, si) 来把预测值对回「日期, 股票」，所以一并返回。"""
+    xs, ys, dis, sis = zip(*batch)
+    return (torch.stack(xs), torch.stack(ys).unsqueeze(-1),
+            torch.stack(dis), torch.stack(sis))
 
 test_ds = StockDataset(
     cache_dir   = args.cache_dir,
@@ -156,28 +176,37 @@ model.eval()
 print(f"Loaded: {args.ckpt}  features={args.enc_in}")
 
 print("Running inference...")
-all_pred, all_label = [], []
+# di/si 直接从 DataLoader 一路带出来，预测值与「日期, 股票」严格同源。
+# 旧写法是按位置 zip(all_pred, test_ds.samples)，只有在
+# DayBatchSampler(shuffle=False) 且日内顺序恰好等于 samples 顺序时才对，
+# 一旦有人改了 sampler 就会静默错配，而长度断言抓不到。
+all_pred, all_label, all_di, all_si = [], [], [], []
 with torch.no_grad():
-    for x, y in test_loader:
+    for x, y, di, si in test_loader:
         pred = model(x.to(device)).cpu().numpy().squeeze()
         y_np = y.numpy().squeeze()
         all_pred.extend(np.atleast_1d(pred).tolist())
         all_label.extend(np.atleast_1d(y_np).tolist())
+        all_di.extend(di.numpy().tolist())
+        all_si.extend(si.numpy().tolist())
 
 samples = test_ds.samples
 dates   = test_ds.dates
 stocks  = test_ds.stocks
-assert len(all_pred) == len(samples)
+assert len(all_pred) == len(samples), \
+    f"推理条数 {len(all_pred)} != 样本数 {len(samples)}"
+assert set(zip(all_di, all_si)) == set((d, s) for d, s in samples), \
+    "推理得到的 (di, si) 集合与 dataset.samples 不一致，DataLoader 可能漏样本或重复"
 
 # 注意：samples 由 StockDataset 构建，过滤条件包含"label 非 NaN"。
 # 这对训练/评估是合理的，但回测候选池若只含 label 有效的股票，
-# 会因为停牌/退市前的股票被静默剔除而产生前视选择偏差（P1.4）。
-# 当前实现中，buyable 过滤已处理涨停/停牌/ST，一定程度上缓解了这个问题；
-# 但理论上正确的做法是独立构建候选池（仅用 T 日已知信息）。
-df = pd.DataFrame([
-    {"date": dates[di], "stock": stocks[si], "pred": all_pred[i], "label": all_label[i]}
-    for i, (di, si) in enumerate(samples)
-])
+# 会因为停牌/退市前的股票被静默剔除而产生前视选择偏差（见 review_new.md L1）。
+df = pd.DataFrame({
+    "date":  [dates[di]  for di in all_di],
+    "stock": [stocks[si] for si in all_si],
+    "pred":  all_pred,
+    "label": all_label,
+})
 df["date"] = pd.to_datetime(df["date"])
 df = df.sort_values(["date", "stock"]).reset_index(drop=True)
 print(f"Inference done: {len(df)} records, {df.date.nunique()} dates")
@@ -198,27 +227,37 @@ df.to_parquet(os.path.join(args.out_dir, "pred_detail.parquet"))
 print(f"  o2o: mean={df['o2o'].mean():.5f}  std={df['o2o'].std():.4f}  "
       f"NaN={n_miss/len(df):.2%}")
 
-# ── 构建 buyable（涨停/停牌/ST 不可买入）─────────────────────────────────
-# buyable[T] 表示 T+1 日开盘能否买入（涨停次日仍可能封板，保守处理：当日涨停则不买）
-print("Building buyable flags from panel...")
+# ── 构建 buyable / sellable ───────────────────────────────────────────────
+# buyable[T]  = T+1 开盘能否买入（涨停次日仍可能封板，保守处理：当日涨停则不买）
+# sellable[T] = T+1 开盘能否卖出（跌停/停牌卖不掉，只过滤买入不过滤卖出是不对称的
+#               乐观假设——A股跌停无法出货很常见，尤其小市值）
+print("Building buyable / sellable flags from panel...")
 panel = pd.read_parquet(
     "/root/dmd/BaoStock/panel.parquet",
-    columns=["open", "high", "pre_close", "trade_status", "is_st"],
+    columns=["open", "high", "low", "pre_close", "trade_status", "is_st"],
 )
 panel = panel.reset_index()
-panel.columns = ["date", "stock", "open", "high", "pre_close", "trade_status", "is_st"]
+panel.columns = ["date", "stock", "open", "high", "low",
+                 "pre_close", "trade_status", "is_st"]
 panel["date"] = pd.to_datetime(panel["date"])
-panel["up_limit"] = (panel["high"] / panel["pre_close"].clip(lower=1e-8) - 1) >= 0.099
+_pc = panel["pre_close"].clip(lower=1e-8)
+panel["up_limit"]   = (panel["high"] / _pc - 1) >=  0.099
+panel["down_limit"] = (panel["low"]  / _pc - 1) <= -0.099
 panel["buyable"]  = (
     (panel["trade_status"] == 1) &
     (~panel["up_limit"]) &
     (panel["is_st"] == 0)
 ).astype(bool)
-buyable_map = {
-    (row.date, row.stock): row.buyable
-    for row in panel[["date", "stock", "buyable"]].itertuples(index=False)
-}
-print(f"  buyable loaded: {len(buyable_map)} records")
+panel["sellable"] = (
+    (panel["trade_status"] == 1) &
+    (~panel["down_limit"])
+).astype(bool)
+buyable_map, sellable_map = {}, {}
+for row in panel[["date", "stock", "buyable", "sellable"]].itertuples(index=False):
+    buyable_map[(row.date, row.stock)]  = row.buyable
+    sellable_map[(row.date, row.stock)] = row.sellable
+print(f"  buyable/sellable loaded: {len(buyable_map)} records  "
+      f"（可买 {panel['buyable'].mean():.1%}，可卖 {panel['sellable'].mean():.1%}）")
 
 # ── 基准 ──────────────────────────────────────────────────────────────────
 bench_map: dict = {}
@@ -255,34 +294,85 @@ mean_rankic = ic_df["rankic"].mean()
 icir        = mean_ic     / (ic_df["ic"].std()     + 1e-8)
 rankicir    = mean_rankic / (ic_df["rankic"].std() + 1e-8)
 ic_pos      = (ic_df["rankic"] > 0).mean()
-# 5日重叠 label 逐日算 IC，IC 序列高度自相关，mean/std 会系统性高估 ICIR 约 √5 倍。
-# 下面同时报告每5日不重叠采样的 ICIR 作为保守估计。
-ic_df_nooverlap = ic_df.iloc[::HORIZON]
-icir_nooverlap     = float(ic_df_nooverlap["ic"].mean()     / (ic_df_nooverlap["ic"].std()     + 1e-8))
-rankicir_nooverlap = float(ic_df_nooverlap["rankic"].mean() / (ic_df_nooverlap["rankic"].std() + 1e-8))
+
+# ── 重叠修正 ─────────────────────────────────────────────────────────────
+# ret_Xd_open[T] = log(open[T+horizon+1]/open[T+1])，实际跨 horizon+1 个交易日，
+# 相邻两天的 label 共享 horizon/(horizon+1) 的行情区间 → 日度 IC 序列高度自相关。
+# 直接用 mean/std 当显著性判据会高估：方差膨胀因子约等于 span，
+# 即有效独立样本 N_eff ≈ N/span，t 统计量要按 √N_eff 而非 √N 折算。
+LABEL_SPAN = HORIZON + 1
+
+
+def icir_nooverlap(s: pd.Series, span: int) -> float:
+    """不重叠采样的 ICIR。对 span 个相位分别采样再取均值——
+    只取单一相位（s.iloc[::span]）的结果对起点很敏感，换个起点就变。"""
+    vals = []
+    for phase in range(span):
+        sub = s.iloc[phase::span].dropna()
+        if len(sub) > 2 and sub.std(ddof=1) > 1e-12:
+            vals.append(sub.mean() / sub.std(ddof=1))
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def newey_west_t(s: pd.Series, lag: int) -> float:
+    """IC 均值的 Newey-West t 统计量（Bartlett 核），直接处理重叠导致的自相关。
+    比不重叠采样更充分利用样本，是判断信号是否显著的首选口径。"""
+    x = s.dropna().values
+    n = len(x)
+    if n < lag + 3:
+        return float("nan")
+    e = x - x.mean()
+    var = float(e @ e) / n
+    for k in range(1, lag + 1):
+        var += 2.0 * (1.0 - k / (lag + 1.0)) * float(e[k:] @ e[:-k]) / n
+    if var <= 0:
+        return float("nan")
+    return float(x.mean() / np.sqrt(var / n))
+
+
+icir_nl     = icir_nooverlap(ic_df["ic"],     LABEL_SPAN)
+rankicir_nl = icir_nooverlap(ic_df["rankic"], LABEL_SPAN)
+t_ic        = newey_west_t(ic_df["ic"],     LABEL_SPAN - 1)
+t_rankic    = newey_west_t(ic_df["rankic"], LABEL_SPAN - 1)
+n_eff       = len(ic_df) / LABEL_SPAN
 ic_df.to_csv(os.path.join(args.out_dir, "ic_series.csv"))
 
 print(f"\n== IC 统计（因子层，基于模型 label）==")
-print(f"  IC={mean_ic:.4f}  ICIR={icir:.4f}（含重叠高估~√{HORIZON}）  "
-      f"ICIR_nooverlap={icir_nooverlap:.4f}")
-print(f"  RankIC={mean_rankic:.4f}  RankICIR={rankicir:.4f}（含重叠）  "
-      f"RankICIR_nooverlap={rankicir_nooverlap:.4f}  RankIC>0={ic_pos:.2%}")
+print(f"  IC    ={mean_ic:.4f}   RankIC={mean_rankic:.4f}   RankIC>0={ic_pos:.2%}")
+print(f"  ICIR    ={icir:.4f}（含重叠，偏乐观）  不重叠={icir_nl:.4f}      t_NW={t_ic:.2f}")
+print(f"  RankICIR={rankicir:.4f}（含重叠，偏乐观）  不重叠={rankicir_nl:.4f}  t_NW={t_rankic:.2f}")
+print(f"  N={len(ic_df)} 天，label 跨 {LABEL_SPAN} 天重叠 → 有效独立样本≈{n_eff:.0f}")
+print(f"  显著性请看 t_NW（|t|>2 才算有信号），不要用含重叠的 ICIR")
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # 核心执行引擎
 # ══════════════════════════════════════════════════════════════════════════
-def cost_count(n_buy: int, n_sell: int, topk: int) -> float:
-    slot = CAP / topk
-    return (n_buy  * max(slot * BUY_C,  MIN_C) +
-            n_sell * max(slot * SELL_C, MIN_C)) / CAP
+def cost_from_weights(w_pre: dict, w_new: dict) -> float:
+    """按实际成交的权重计费，返回占组合净值的比例。
+
+    旧实现按「换仓只数 × 单档名义金额」计费，隐含每档权重恒等于 1/topk，
+    与 drift 口径下的真实权重不符；改成按 |w_new - w_pre| 逐只计费后，
+    equal 模式下被强制拉回等权的那部分再平衡交易也会如实收费。
+    """
+    total = 0.0
+    for s in set(w_pre) | set(w_new):
+        d = w_new.get(s, 0.0) - w_pre.get(s, 0.0)
+        notional = abs(d) * CAP
+        if notional < 1.0:        # 忽略权重浮尘，否则每只都要吃一次 min_cost
+            continue
+        rate = BUY_C if d > 0 else SELL_C
+        total += max(notional * rate, MIN_C)
+    return total / CAP
 
 
 def topkdrop(score: pd.Series, current: list, topk: int, n_drop: int,
-             buyable: pd.Series | None = None) -> list:
+             buyable: pd.Series | None = None,
+             sellable: pd.Series | None = None) -> list:
     """
     参照参考包 choose_topkdrop（keep 模式）。
-    buyable: index=stock，bool，False 表示涨停/停牌/ST，不可新买入（已持仓可继续持有）。
+    buyable:  index=stock，False 表示涨停/停牌/ST，不可新买入（已持仓可继续持有）。
+    sellable: index=stock，False 表示跌停/停牌，卖不掉，被迫继续持有。
     """
     pred = score.dropna().sort_values(ascending=False)
     if pred.empty:
@@ -304,6 +394,9 @@ def topkdrop(score: pd.Series, current: list, topk: int, n_drop: int,
     cands  = cand_pool.head(n_new).index.tolist()
     pool   = pred.reindex(last + cands).sort_values(ascending=False).index.tolist()
     sells  = set(pool[-n_drop:]) if n_drop > 0 else set()
+    # 跌停/停牌的持仓卖不掉，从卖出名单里剔除，被迫留在组合里
+    if sellable is not None:
+        sells = {c for c in sells if bool(sellable.get(c, True))}
     kept   = not_in + [c for c in last if c not in sells]
     buys   = [c for c in cand_pool.index if c not in set(kept) and c not in cur_set]
     result = (kept + buys)[:topk]
@@ -319,50 +412,90 @@ def topkdrop(score: pd.Series, current: list, topk: int, n_drop: int,
 
 def simulate(topk: int, n_drop: int) -> pd.DataFrame:
     """
-    每日调仓 TopKDrop，对齐 run_backtest.py 结算逻辑：
-      T 日：pred → topkdrop → new（buyable 过滤涨停/停牌/ST）
-            gross = mean(o2o[T] of new)   ← new 在 T+1 开盘买入，T+2 开盘卖出
-            cost  = 换仓成本（new vs current）
-            current = new
+    每日调仓 TopKDrop：
+      T 日：pred → topkdrop → new（buyable 挡涨停/停牌/ST，sellable 挡跌停/停牌）
+            gross = Σ w_new[i] × o2o[T][i]   ← new 在 T+1 开盘买入，T+2 开盘卖出
+            cost  = 按 |w_new − w_pre| 逐只计费
+            收盘后权重随收益漂移，作为下一日的 w_pre
+
+    权重口径（--weight_mode）：
+      drift — 保留仓位的权重随收益自然漂移，卖出释放的权重等分给新买入；
+              若当日没有新买入，释放的权重按比例回到保留仓位（等比缩放，
+              不改变相对权重，无需交易，不计费）。
+      equal — 每日把组合强制拉回等权。这是旧口径，隐含每天免费再平衡一次，
+              对波动大的小盘股会白拿一份再平衡收益；现在这部分交易会如实计费。
     """
-    current: list = []
+    w: dict = {}          # stock -> 权重，有持仓时 sum(w) == 1
     nav = 1.0
     rows = []
     for date in all_dates_sorted:
         day_df   = df_by_date[date]
         score    = day_df["pred"]
         date_ts  = pd.Timestamp(date)
+        o2o      = day_df["o2o"]
 
-        # buyable：当日涨停/停牌/ST 不可新买
         buyable_day = pd.Series({
             stock: buyable_map.get((date_ts, stock), True)
             for stock in day_df.index
         })
+        # 卖出约束只对当前持仓有意义，持仓可能已不在当日截面里，单独取
+        current = list(w.keys())
+        sellable_day = pd.Series({
+            stock: sellable_map.get((date_ts, stock), True)
+            for stock in set(day_df.index) | set(current)
+        })
 
-        new = topkdrop(score, current, topk, n_drop, buyable=buyable_day)
+        new = topkdrop(score, current, topk, n_drop,
+                       buyable=buyable_day, sellable=sellable_day)
 
-        # gross = new 持仓在当日 o2o 的均值（对齐 run_backtest.py 第 409 行）
-        gross = float(day_df["o2o"].reindex(new).fillna(0.0).mean()) if new else 0.0
+        # ── 目标权重 ──────────────────────────────────────────────────────
+        w_pre = dict(w)
+        if not new:
+            w_new = {}
+        elif WMODE == "equal":
+            w_new = {s: 1.0 / len(new) for s in new}
+        else:
+            kept = [s for s in new if s in w_pre]
+            buys = [s for s in new if s not in w_pre]
+            freed = 1.0 - sum(w_pre[s] for s in kept) if w_pre else 1.0
+            w_new = {s: w_pre[s] for s in kept}
+            if buys:
+                per = max(freed, 0.0) / len(buys)
+                for s in buys:
+                    w_new[s] = per
+            tot = sum(w_new.values())
+            if tot > 1e-12:
+                w_new = {s: v / tot for s, v in w_new.items()}
 
-        cur_set, new_set = set(current), set(new)
-        n_sell = len(cur_set - new_set)
-        n_buy  = len(new_set - cur_set) if current else len(new_set)
-        cost   = cost_count(n_buy, n_sell, topk)
-        net    = gross - cost
-        nav   *= 1.0 + net
+        gross = sum(wt * float(o2o.get(s, 0.0)) for s, wt in w_new.items())
+        cost  = cost_from_weights(w_pre, w_new)
+        net   = gross - cost
+        nav  *= 1.0 + net
+
+        cur_set, new_set = set(w_pre), set(new)
+        turnover_w = sum(abs(w_new.get(s, 0.0) - w_pre.get(s, 0.0))
+                         for s in cur_set | new_set)
 
         bench = float(bench_map.get(date_ts, float("nan")))
         rows.append({
-            "date":      date,
-            "gross":     gross,
-            "net":       net,
-            "nav":       nav,
-            "n_buy":     n_buy,
-            "n_sell":    n_sell,
-            "turnover":  (n_buy + n_sell) / topk,
-            "bench_o2o": bench,
+            "date":        date,
+            "gross":       gross,
+            "net":         net,
+            "nav":         nav,
+            "n_buy":       len(new_set - cur_set),
+            "n_sell":      len(cur_set - new_set),
+            "turnover":    turnover_w,          # 权重口径的双边换手
+            "n_hold":      len(new_set),
+            "bench_o2o":   bench,
         })
-        current = new
+
+        # ── 权重漂移到下一日 ──────────────────────────────────────────────
+        w = {s: wt * (1.0 + float(o2o.get(s, 0.0))) for s, wt in w_new.items()}
+        tot = sum(w.values())
+        if tot > 1e-12:
+            w = {s: v / tot for s, v in w.items()}
+        else:
+            w = {}
 
     return pd.DataFrame(rows)
 

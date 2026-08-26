@@ -186,13 +186,15 @@ class StockDataset(Dataset):
             ch = float(self.close_arr[di + self.horizon, si])
             y  = np.float32(np.log(ch / c0))
 
-        return torch.from_numpy(x), torch.tensor(y), torch.tensor(di)
+        # 同时返回 (di, si)，让下游（回测）能显式对齐预测值与「日期,股票」，
+        # 而不是依赖 DataLoader 的产出顺序恰好等于 self.samples 的顺序。
+        return torch.from_numpy(x), torch.tensor(y), torch.tensor(di), torch.tensor(si)
 
 
 def stock_collate_fn(batch):
     """stack 即可，rank 归一化已在 build_label_lib.py 离线完成（全 universe 截面）。
-    返回 (x, y)，y shape = (B, 1)。"""
-    xs, ys, _ = zip(*batch)
+    返回 (x, y)，y shape = (B, 1)。训练不需要 di/si，直接丢弃。"""
+    xs, ys, _, _ = zip(*batch)
     return torch.stack(xs), torch.stack(ys).unsqueeze(-1)
 
 

@@ -254,9 +254,14 @@ def build_fea2(panel):
     for col, (lo, hi) in clip_dict.items():
         if col in feat.columns:
             feat[col] = feat[col].clip(lower=lo, upper=hi)
-    feat = feat.fillna(0)
 
-    # 截面 z-score：每日在全截面标准化，对齐模型输入期望（与 fea1/fea3 口径一致）
+    # 顺序很重要：必须先 z-score 再 fillna(0)。
+    # 资金流 18 列是 reindex 上来的，估值 3 列来自另一张表，缺失量大；
+    # 若先 fillna(0) 再标准化，这些 0 会进入当日截面的 mean/std——而资金流原始值
+    # 是 log(x+1)/rolling_std ≈ 20~60 的正数，0 是极端离群点，会污染整个截面的
+    # 均值和标准差，且缺失率随年份变化会给特征注入虚假的时间趋势。
+    # 先标准化（pandas 的 mean/std 自动跳过 NaN），再 fillna(0)，
+    # 此时 0 恰好等于"当日截面均值"，是中性填充。
     feat = cs_zscore(feat)
     feat = feat.replace([np.inf, -np.inf], np.nan).fillna(0)
 

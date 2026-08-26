@@ -83,7 +83,7 @@ fea_name_map = {
     "fea3": "fea3_alpha191.parquet",
 }
 
-feat_dfs = []
+feat_dfs, loaded_names = [], []
 for fea in args.fea:
     fname = fea_name_map.get(fea, fea + ".parquet")
     fpath = os.path.join(args.fea_dir, fname)
@@ -96,23 +96,24 @@ for fea in args.fea:
         pd.to_datetime(df.index.get_level_values("datetime").unique()), level="datetime"
     )
     feat_dfs.append(df)
+    loaded_names.append(fea)   # 与 feat_dfs 严格对齐，跳过的特征集不会让前缀错位
 
 if not feat_dfs:
     raise RuntimeError("No feature files loaded. Run build_feature_lib.py first.")
 
-if len(feat_dfs) == 1:
-    feat_df = feat_dfs[0]
-else:
-    # 多特征集拼合：重名列加特征集前缀避免 join 报错（如 fea1/fea2 共有 ret_5d）
-    labeled = []
-    for fea_name, df in zip(args.fea, feat_dfs):
-        dup = set(df.columns)
-        for prev_df in labeled:
-            dup &= set(prev_df.columns)
-        if dup:
-            df = df.rename(columns={c: f"{fea_name}_{c}" for c in dup})
-        labeled.append(df)
-    feat_df = labeled[0].join(labeled[1:], how="outer")
+# 多特征集拼合：只给「与已收录列重名」的列加特征集前缀，避免 join 报错
+# （如 fea1/fea2 共有 ret_5d）。seen 是累积集合，所以第一个特征集永远不改名，
+# 单独加载某个特征集时列名与多集拼合时保持一致，缓存之间可互换。
+seen, labeled = set(), []
+for fea_name, df in zip(loaded_names, feat_dfs):
+    dup = set(df.columns) & seen
+    if dup:
+        print(f"  [rename] {fea_name}: {sorted(dup)} -> 加前缀 {fea_name}_")
+        df = df.rename(columns={c: f"{fea_name}_{c}" for c in dup})
+    seen |= set(df.columns)
+    labeled.append(df)
+
+feat_df = labeled[0] if len(labeled) == 1 else labeled[0].join(labeled[1:], how="outer")
 # 过滤日期
 mask = (feat_df.index.get_level_values("datetime") >= start) & \
        (feat_df.index.get_level_values("datetime") <= end)

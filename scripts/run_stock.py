@@ -256,3 +256,5 @@ model.load_state_dict(ckpt["state_dict"] if "state_dict" in ckpt else ckpt)
 test_mse, test_ic, test_icir, test_rankic, test_rankicir = evaluate(test_loader)
 print(f"Test  mse={test_mse:.4f}  IC={test_ic:.4f}  ICIR={test_icir:.4f}  "
       f"RankIC={test_rankic:.4f}  RankICIR={test_rankicir:.4f}")
+print(f"注意：ICIR/RankICIR 含 {args.horizon + 1} 天重叠，会高估约 √span 倍；"
+      f"严谨的显著性判据见 backtest.py 输出的 t_NW")
