@@ -87,6 +87,8 @@ python data/scripts/build_label_lib.py
 # 构建 fea3（Alpha191，依赖 Qlib）—— 可选
 python data/scripts/compute_fea3_fullmkt.py
 
+python data/scripts/build_fea3_v5_770.py
+
 # Alpha191 因子筛选（输出 data/selected_factors.txt）—— 构建 fea3 后运行
 python data/scripts/select_factors.py
 ```
@@ -108,6 +110,12 @@ python data/scripts/build_cache.py --fea fea2 --label ret_5d_open --universe hs3
 
 # 全市场 + fea2 + 5日开开收益
 python data/scripts/build_cache.py --fea fea2 --label ret_5d_open --universe all
+
+python data/scripts/build_cache.py \
+  --fea fea3 \
+  --fea3_file fea3_v5_770.parquet \
+  --label ret_5d_avg_open \
+  --universe all \
 ```
 
 缓存保存至 `data/cache/cache_{tag}/`，包含：
@@ -118,7 +126,9 @@ python data/scripts/build_cache.py --fea fea2 --label ret_5d_open --universe all
 - `universe_mask.npy`：`(T, S)` 点时间成分股掩码（非全市场时）
 - `meta.json`：构建参数记录
 
-### 4. 训练
+### 4. 训练（训练完自动回测）
+
+训练结束后默认自动调用 `backtest.py`，回测结果目录与 `--ckpt_dir` 同名，自动写入 `backtest_results/<ckpt_name>/`。
 
 ```bash
 nohup python scripts/run_stock.py \
@@ -126,14 +136,18 @@ nohup python scripts/run_stock.py \
   --seq_len 30 --horizon 5 \
   --loss combined --ic_weight 0.05 \
   --ckpt_dir checkpoints/my_run \
+  --topk 30 --n_drop 6 \
   > logs/my_run.log 2>&1 &
+# 训练完成后自动回测，结果写入 backtest_results/my_run/
 ```
+
+加 `--no_backtest` 可跳过自动回测，只保存 checkpoint。
 
 主要参数：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--cache_dir` | `data/cache/cache_fea2_ret5do` | 缓存目录 |
+| `--cache_dir` | `data/cache/cache_fea2_ret5do` | 训练+回测缓存目录（同一份） |
 | `--seq_len` | 30 | 历史窗口（交易日） |
 | `--horizon` | 5 | 预测窗口，用于 label embargo |
 | `--d_model` | 256 | Transformer 嵌入维度 |
@@ -144,8 +158,16 @@ nohup python scripts/run_stock.py \
 | `--loss` | `combined` | `mse` / `rankic` / `combined` |
 | `--ic_weight` | 0.05 | combined loss 中 IC 项权重，需按 label 量纲校准 |
 | `--class_strategy` | `mean` | `mean`（均值池化）/ `cls_token` |
+| `--no_backtest` | — | 加上则跳过自动回测 |
+| `--backtest_cache_dir` | 同 `--cache_dir` | 仅在回测用不同股票池时指定（如训练全市场、回测 HS300） |
+| `--topk` | — | 回测 custom 组 TopK（不传只跑 baseline k30d3） |
+| `--n_drop` | — | 回测 custom 组 Drop 数 |
+| `--slippage_bps` | 0 | 回测单边滑点（bps） |
+| `--weight_mode` | `drift` | 回测权重口径（`drift` 正确口径 / `equal` 旧口径） |
 
-### 5. 回测
+### 5. 单独回测（可选）
+
+自动回测通常已够用。需要单独重跑或调整参数时：
 
 ```bash
 nohup python scripts/backtest.py \
@@ -192,7 +214,7 @@ data/scripts/select_factors.py      →  data/selected_factors.txt（Alpha191筛
 data/scripts/build_cache.py         →  data/cache/cache_*/（numpy缓存）
     ↓
 scripts/run_stock.py                →  checkpoints/*/best.pt
-    ↓
+    ↓ （训练完自动触发，out_dir = backtest_results/<ckpt_name>/）
 scripts/backtest.py                 →  backtest_results/*/{backtest.png,exec_metrics.csv,summary.md}
 ```
 

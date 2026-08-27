@@ -97,24 +97,27 @@ parser.add_argument("--n_groups",    type=int,   default=5)
 parser.add_argument("--benchmark",   default="/root/dmd/BaoStock/Index/sh.000001.csv")
 parser.add_argument("--out_dir",     default="backtest_results")
 parser.add_argument("--num_workers", type=int,   default=4)
+parser.add_argument("--pred_parquet", default=None,
+                    help="直接传入已有 pred_detail.parquet 路径，跳过 ckpt 加载和模型推理")
 args = parser.parse_args()
 
 os.makedirs(args.out_dir, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── 从 checkpoint 恢复训练参数 ────────────────────────────────────────────
-raw_ckpt = torch.load(args.ckpt, map_location="cpu")
-if isinstance(raw_ckpt, dict) and "args" in raw_ckpt:
-    saved = raw_ckpt["args"]
-    for k in ["seq_len", "horizon",
-              "train_start", "train_end", "val_start", "val_end",
-              "test_start", "test_end", "train_ratio", "val_ratio",
-              "d_model", "n_heads", "e_layers", "d_ff", "mlp_hidden",
-              "class_strategy", "embed", "freq", "factor", "activation"]:
-        if k in saved:
-            setattr(args, k, saved[k])
-    print(f"[backtest] Restored from ckpt: seq_len={args.seq_len}  "
-          f"horizon={args.horizon}  test={args.test_start}~{args.test_end}")
+if args.pred_parquet is None:
+    # ── 从 checkpoint 恢复训练参数 ────────────────────────────────────────────
+    raw_ckpt = torch.load(args.ckpt, map_location="cpu")
+    if isinstance(raw_ckpt, dict) and "args" in raw_ckpt:
+        saved = raw_ckpt["args"]
+        for k in ["seq_len", "horizon",
+                  "train_start", "train_end", "val_start", "val_end",
+                  "test_start", "test_end", "train_ratio", "val_ratio",
+                  "d_model", "n_heads", "e_layers", "d_ff", "mlp_hidden",
+                  "class_strategy", "embed", "freq", "factor", "activation"]:
+            if k in saved:
+                setattr(args, k, saved[k])
+        print(f"[backtest] Restored from ckpt: seq_len={args.seq_len}  "
+              f"horizon={args.horizon}  test={args.test_start}~{args.test_end}")
 
 HORIZON = args.horizon
 CAP     = args.capital
@@ -146,86 +149,96 @@ if run_custom:
 else:
     print("Custom: 未指定，只跑 baseline")
 
-# ── 加载数据集 ────────────────────────────────────────────────────────────
-def raw_collate(batch):
-    """回测需要 (di, si) 来把预测值对回「日期, 股票」，所以一并返回。"""
-    xs, ys, dis, sis = zip(*batch)
-    return (torch.stack(xs), torch.stack(ys).unsqueeze(-1),
-            torch.stack(dis), torch.stack(sis))
+# ── 推理 or 直接加载预测 ─────────────────────────────────────────────────
+if args.pred_parquet:
+    # 跳过模型推理，直接读已有 pred_detail.parquet
+    print(f"[pred_parquet mode] Loading {args.pred_parquet}")
+    df = pd.read_parquet(args.pred_parquet)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(["date", "stock"]).reset_index(drop=True)
+    # 确保有 o2o 列；若没有则重新 merge
+    if "o2o" not in df.columns:
+        print("Loading ret_1d_open from label_lib...")
+        lib = pd.read_parquet(args.label_lib, columns=["ret_1d_open"])
+        lib = lib.reset_index()
+        lib.columns = ["date", "stock", "o2o"]
+        lib["date"] = pd.to_datetime(lib["date"])
+        df = df.merge(lib, on=["date", "stock"], how="left")
+        df["o2o"] = df["o2o"].fillna(0.0)
+    print(f"Loaded: {len(df)} records, {df.date.nunique()} dates")
+else:
+    # ── 加载数据集 ────────────────────────────────────────────────────────────
+    def raw_collate(batch):
+        """回测需要 (di, si) 来把预测值对回「日期, 股票」，所以一并返回。"""
+        xs, ys, dis, sis = zip(*batch)
+        return (torch.stack(xs), torch.stack(ys).unsqueeze(-1),
+                torch.stack(dis), torch.stack(sis))
 
-test_ds = StockDataset(
-    cache_dir   = args.cache_dir,
-    seq_len     = args.seq_len,
-    horizon     = args.horizon,
-    flag        = "test",
-    train_start = args.train_start, train_end = args.train_end,
-    val_start   = args.val_start,   val_end   = args.val_end,
-    test_start  = args.test_start,  test_end  = args.test_end,
-    train_ratio = args.train_ratio, val_ratio = args.val_ratio,
-)
-test_loader = DataLoader(
-    test_ds, batch_sampler=DayBatchSampler(test_ds, shuffle=False),
-    collate_fn=raw_collate, num_workers=args.num_workers,
-)
+    test_ds = StockDataset(
+        cache_dir   = args.cache_dir,
+        seq_len     = args.seq_len,
+        horizon     = args.horizon,
+        flag        = "test",
+        train_start = args.train_start, train_end = args.train_end,
+        val_start   = args.val_start,   val_end   = args.val_end,
+        test_start  = args.test_start,  test_end  = args.test_end,
+        train_ratio = args.train_ratio, val_ratio = args.val_ratio,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_sampler=DayBatchSampler(test_ds, shuffle=False),
+        collate_fn=raw_collate, num_workers=args.num_workers,
+    )
 
-# ── 加载模型 & 推理 ───────────────────────────────────────────────────────
-args.enc_in = test_ds.n_features
-model = Model(args).to(device)
-model.load_state_dict(raw_ckpt["state_dict"] if "state_dict" in raw_ckpt else raw_ckpt)
-model.eval()
-print(f"Loaded: {args.ckpt}  features={args.enc_in}")
+    # ── 加载模型 & 推理 ───────────────────────────────────────────────────────
+    args.enc_in = test_ds.n_features
+    model = Model(args).to(device)
+    model.load_state_dict(raw_ckpt["state_dict"] if "state_dict" in raw_ckpt else raw_ckpt)
+    model.eval()
+    print(f"Loaded: {args.ckpt}  features={args.enc_in}")
 
-print("Running inference...")
-# di/si 直接从 DataLoader 一路带出来，预测值与「日期, 股票」严格同源。
-# 旧写法是按位置 zip(all_pred, test_ds.samples)，只有在
-# DayBatchSampler(shuffle=False) 且日内顺序恰好等于 samples 顺序时才对，
-# 一旦有人改了 sampler 就会静默错配，而长度断言抓不到。
-all_pred, all_label, all_di, all_si = [], [], [], []
-with torch.no_grad():
-    for x, y, di, si in test_loader:
-        pred = model(x.to(device)).cpu().numpy().squeeze()
-        y_np = y.numpy().squeeze()
-        all_pred.extend(np.atleast_1d(pred).tolist())
-        all_label.extend(np.atleast_1d(y_np).tolist())
-        all_di.extend(di.numpy().tolist())
-        all_si.extend(si.numpy().tolist())
+    print("Running inference...")
+    all_pred, all_label, all_di, all_si = [], [], [], []
+    with torch.no_grad():
+        for x, y, di, si in test_loader:
+            pred = model(x.to(device)).cpu().numpy().squeeze()
+            y_np = y.numpy().squeeze()
+            all_pred.extend(np.atleast_1d(pred).tolist())
+            all_label.extend(np.atleast_1d(y_np).tolist())
+            all_di.extend(di.numpy().tolist())
+            all_si.extend(si.numpy().tolist())
 
-samples = test_ds.samples
-dates   = test_ds.dates
-stocks  = test_ds.stocks
-assert len(all_pred) == len(samples), \
-    f"推理条数 {len(all_pred)} != 样本数 {len(samples)}"
-assert set(zip(all_di, all_si)) == set((d, s) for d, s in samples), \
-    "推理得到的 (di, si) 集合与 dataset.samples 不一致，DataLoader 可能漏样本或重复"
+    samples = test_ds.samples
+    dates   = test_ds.dates
+    stocks  = test_ds.stocks
+    assert len(all_pred) == len(samples), \
+        f"推理条数 {len(all_pred)} != 样本数 {len(samples)}"
+    assert set(zip(all_di, all_si)) == set((d, s) for d, s in samples), \
+        "推理得到的 (di, si) 集合与 dataset.samples 不一致，DataLoader 可能漏样本或重复"
 
-# 注意：samples 由 StockDataset 构建，过滤条件包含"label 非 NaN"。
-# 这对训练/评估是合理的，但回测候选池若只含 label 有效的股票，
-# 会因为停牌/退市前的股票被静默剔除而产生前视选择偏差（见 review_new.md L1）。
-df = pd.DataFrame({
-    "date":  [dates[di]  for di in all_di],
-    "stock": [stocks[si] for si in all_si],
-    "pred":  all_pred,
-    "label": all_label,
-})
-df["date"] = pd.to_datetime(df["date"])
-df = df.sort_values(["date", "stock"]).reset_index(drop=True)
-print(f"Inference done: {len(df)} records, {df.date.nunique()} dates")
+    df = pd.DataFrame({
+        "date":  [dates[di]  for di in all_di],
+        "stock": [stocks[si] for si in all_si],
+        "pred":  all_pred,
+        "label": all_label,
+    })
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(["date", "stock"]).reset_index(drop=True)
+    print(f"Inference done: {len(df)} records, {df.date.nunique()} dates")
 
-# ── 加载 ret_1d_open（T+1 开盘买入、T+2 开盘卖出，日度结算）────────────
-print("Loading ret_1d_open from label_lib...")
-lib = pd.read_parquet(args.label_lib, columns=["ret_1d_open"])
-lib = lib.reset_index()
-lib.columns = ["date", "stock", "o2o"]
-lib["date"] = pd.to_datetime(lib["date"])
-df = df.merge(lib, on=["date", "stock"], how="left")
-n_miss = df["o2o"].isna().sum()
-if n_miss:
-    print(f"  [WARN] {n_miss}/{len(df)} 条记录无 o2o，填 0")
-df["o2o"] = df["o2o"].fillna(0.0)
-df.to_parquet(os.path.join(args.out_dir, "pred_detail.parquet"))
-
-print(f"  o2o: mean={df['o2o'].mean():.5f}  std={df['o2o'].std():.4f}  "
-      f"NaN={n_miss/len(df):.2%}")
+    # ── 加载 ret_1d_open ────────────────────────────────────────────────────
+    print("Loading ret_1d_open from label_lib...")
+    lib = pd.read_parquet(args.label_lib, columns=["ret_1d_open"])
+    lib = lib.reset_index()
+    lib.columns = ["date", "stock", "o2o"]
+    lib["date"] = pd.to_datetime(lib["date"])
+    df = df.merge(lib, on=["date", "stock"], how="left")
+    n_miss = df["o2o"].isna().sum()
+    if n_miss:
+        print(f"  [WARN] {n_miss}/{len(df)} 条记录无 o2o，填 0")
+    df["o2o"] = df["o2o"].fillna(0.0)
+    df.to_parquet(os.path.join(args.out_dir, "pred_detail.parquet"))
+    print(f"  o2o: mean={df['o2o'].mean():.5f}  std={df['o2o'].std():.4f}  "
+          f"NaN={n_miss/len(df):.2%}")
 
 # ── 构建 buyable / sellable ───────────────────────────────────────────────
 # buyable[T]  = T+1 开盘能否买入（涨停次日仍可能封板，保守处理：当日涨停则不买）
@@ -343,6 +356,36 @@ print(f"  ICIR    ={icir:.4f}（含重叠，偏乐观）  不重叠={icir_nl:.4f
 print(f"  RankICIR={rankicir:.4f}（含重叠，偏乐观）  不重叠={rankicir_nl:.4f}  t_NW={t_rankic:.2f}")
 print(f"  N={len(ic_df)} 天，label 跨 {LABEL_SPAN} 天重叠 → 有效独立样本≈{n_eff:.0f}")
 print(f"  显著性请看 t_NW（|t|>2 才算有信号），不要用含重叠的 ICIR")
+
+# ── o2o IC（与回测结算口径绑定，T+1开盘买入T+2开盘卖出的日度收益）────────────
+# 用 ret_1d_open 而非模型训练 label，不依赖 cache 种类，所有模型横向可比
+o2o_ic_rows = []
+for date, grp in df.groupby("date"):
+    if len(grp) < 10:
+        continue
+    valid = grp["o2o"].notna()
+    if valid.sum() < 10:
+        continue
+    g = grp[valid]
+    ic_v,  _ = pearsonr(g["pred"],  g["o2o"])
+    ric_v, _ = spearmanr(g["pred"], g["o2o"])
+    if not np.isnan(ic_v + ric_v):
+        o2o_ic_rows.append({"date": date, "ic": float(ic_v), "rankic": float(ric_v)})
+
+o2o_ic_df      = pd.DataFrame(o2o_ic_rows).set_index("date")
+o2o_mean_ic     = o2o_ic_df["ic"].mean()     if len(o2o_ic_df) else float("nan")
+o2o_mean_rankic = o2o_ic_df["rankic"].mean() if len(o2o_ic_df) else float("nan")
+o2o_icir        = o2o_mean_ic     / (o2o_ic_df["ic"].std()     + 1e-8) if len(o2o_ic_df) > 1 else float("nan")
+o2o_rankicir    = o2o_mean_rankic / (o2o_ic_df["rankic"].std() + 1e-8) if len(o2o_ic_df) > 1 else float("nan")
+o2o_ic_pos      = (o2o_ic_df["rankic"] > 0).mean() if len(o2o_ic_df) else float("nan")
+# o2o 无重叠（span=1），t 统计直接用标准公式
+o2o_t_rankic    = newey_west_t(o2o_ic_df["rankic"], lag=0) if len(o2o_ic_df) > 1 else float("nan")
+o2o_ic_df.to_csv(os.path.join(args.out_dir, "o2o_ic_series.csv"))
+
+print(f"\n== IC 统计（执行层，基于 ret_1d_open o2o，与回测结算绑定）==")
+print(f"  IC    ={o2o_mean_ic:.4f}   RankIC={o2o_mean_rankic:.4f}   RankIC>0={o2o_ic_pos:.2%}")
+print(f"  ICIR={o2o_icir:.4f}   RankICIR={o2o_rankicir:.4f}   t_NW={o2o_t_rankic:.2f}")
+print(f"  N={len(o2o_ic_df)} 天（无重叠，t_NW 可直接用于显著性判断）")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -792,6 +835,8 @@ md_lines = [
     f"",
     f"## Factor Quality",
     f"",
+    f"### 模型 Label（基于 cache label，含重叠）",
+    f"",
     f"| Metric | Value |",
     f"|--------|-------|",
     f"| IC | {mean_ic:.4f} |",
@@ -799,6 +844,17 @@ md_lines = [
     f"| RankIC | {mean_rankic:.4f} |",
     f"| RankICIR | {rankicir:.4f} |",
     f"| RankIC > 0 | {ic_pos:.2%} |",
+    f"",
+    f"### 执行层 o2o（ret_1d_open，与回测结算绑定，无重叠，横向可比）",
+    f"",
+    f"| Metric | Value |",
+    f"|--------|-------|",
+    f"| IC | {o2o_mean_ic:.4f} |",
+    f"| ICIR | {o2o_icir:.4f} |",
+    f"| RankIC | {o2o_mean_rankic:.4f} |",
+    f"| RankICIR | {o2o_rankicir:.4f} |",
+    f"| RankIC > 0 | {o2o_ic_pos:.2%} |",
+    f"| t_NW | {o2o_t_rankic:.2f} |",
     f"",
 ]
 

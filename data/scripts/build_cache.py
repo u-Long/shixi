@@ -59,6 +59,8 @@ parser.add_argument("--tag",        default=None,
                     help="缓存目录后缀，默认自动生成 fea1_fea2_hs300_ret10d")
 parser.add_argument("--fea2_file",  default=None,
                     help="覆盖 fea2 的 parquet 文件名（如 fea2_price_new_0826.parquet），默认 fea2_price_new.parquet")
+parser.add_argument("--fea3_file",  default=None,
+                    help="覆盖 fea3 的 parquet 文件名（如 fea3_v5_770.parquet），默认 fea3_alpha191.parquet")
 args = parser.parse_args()
 
 # 自动生成 tag（含 universe，全市场时省略）
@@ -80,7 +82,7 @@ end   = pd.Timestamp(args.end_date)
 fea_name_map = {
     "fea1": "fea1_price_basic.parquet",
     "fea2": args.fea2_file if args.fea2_file else "fea2_price_new.parquet",
-    "fea3": "fea3_alpha191.parquet",
+    "fea3": args.fea3_file if args.fea3_file else "fea3_alpha191.parquet",
 }
 
 feat_dfs, loaded_names = [], []

@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 from scipy.stats import spearmanr, pearsonr
 
 from data_provider.stock_dataset import StockDataset, stock_collate_fn, DayBatchSampler
-from model.iTransformer_stock import Model
+import importlib
 
 
 # ── 固定随机种子 ────────────────────────────────────────────────────────────
@@ -72,9 +72,21 @@ parser.add_argument("--ic_weight",    type=float, default=0.05,
                          "  raw ret_5d_open (std≈0.04): MSE~0.003, |IC|~0.05 → ic_weight≈0.05\n"
                          "  rank_sym ∈[-1,1]:           MSE~1.0,   |IC|~0.1  → ic_weight≈10")
 parser.add_argument("--ckpt_dir",      default="checkpoints/stock")
+parser.add_argument("--model",         default="iTransformer_stock", help="model 模块名，如 iTransformer_stock_1")
+parser.add_argument("--gpu",           type=int, default=None, help="指定 GPU 编号，如 --gpu 1；不传则使用默认 cuda 设备")
+
+# 自动回测
+parser.add_argument("--no_backtest",   action="store_true", help="训练完成后不自动执行回测")
+parser.add_argument("--backtest_cache_dir", default=None,
+                    help="回测用 cache_dir，不传则复用 --cache_dir")
+parser.add_argument("--topk",          type=int, default=None, help="回测 TopK，不传则只跑 baseline k30d3")
+parser.add_argument("--n_drop",        type=int, default=None, help="回测 Drop 数")
+parser.add_argument("--slippage_bps",  type=float, default=0.0, help="回测单边滑点（bps）")
+parser.add_argument("--weight_mode",   default="drift", choices=["drift", "equal"], help="回测权重口径")
 
 args = parser.parse_args()
 os.makedirs(args.ckpt_dir, exist_ok=True)
+Model = importlib.import_module(f"model.{args.model}").Model
 
 # 训练开始时立即保存运行配置，方便事后溯源
 import json
@@ -85,7 +97,10 @@ _config = {
 with open(os.path.join(args.ckpt_dir, "config.json"), "w") as _f:
     json.dump(_config, _f, indent=2, ensure_ascii=False)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if args.gpu is not None:
+    device = torch.device(f"cuda:{args.gpu}")
+else:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
 # ── 数据集 ──────────────────────────────────────────────────────────────────
@@ -258,3 +273,34 @@ print(f"Test  mse={test_mse:.4f}  IC={test_ic:.4f}  ICIR={test_icir:.4f}  "
       f"RankIC={test_rankic:.4f}  RankICIR={test_rankicir:.4f}")
 print(f"注意：ICIR/RankICIR 含 {args.horizon + 1} 天重叠，会高估约 √span 倍；"
       f"严谨的显著性判据见 backtest.py 输出的 t_NW")
+
+# ── 自动回测 ──────────────────────────────────────────────────────────────────
+if not args.no_backtest:
+    import subprocess
+    # out_dir 与 ckpt_dir 同名（去掉 checkpoints/ 前缀后挂到 backtest_results/）
+    ckpt_basename = os.path.basename(os.path.normpath(args.ckpt_dir))
+    bt_out_dir    = os.path.join("backtest_results", ckpt_basename)
+    bt_cache_dir  = args.backtest_cache_dir if args.backtest_cache_dir else args.cache_dir
+
+    bt_cmd = [
+        sys.executable, os.path.join(os.path.dirname(__file__), "backtest.py"),
+        "--ckpt",      best_ckpt,
+        "--cache_dir", bt_cache_dir,
+        "--out_dir",   bt_out_dir,
+        "--slippage_bps", str(args.slippage_bps),
+        "--weight_mode",  args.weight_mode,
+    ]
+    if args.topk   is not None: bt_cmd += ["--topk",   str(args.topk)]
+    if args.n_drop is not None: bt_cmd += ["--n_drop", str(args.n_drop)]
+
+    print(f"\n{'='*60}")
+    print(f"[auto-backtest] 开始回测: {best_ckpt}")
+    print(f"[auto-backtest] 结果目录: {bt_out_dir}")
+    print(f"[auto-backtest] 命令: {' '.join(bt_cmd)}")
+    print(f"{'='*60}\n")
+
+    ret = subprocess.run(bt_cmd)
+    if ret.returncode != 0:
+        print(f"\n[auto-backtest] 回测进程返回非零状态 {ret.returncode}，请检查输出。")
+    else:
+        print(f"\n[auto-backtest] 回测完成，结果见 {bt_out_dir}/")
