@@ -47,13 +47,15 @@ parser.add_argument("--train_ratio", type=float, default=0.7)
 parser.add_argument("--val_ratio",   type=float, default=0.15)
 
 # 模型
-parser.add_argument("--d_model",       type=int,   default=256)
+parser.add_argument("--d_model",       type=int,   default=128)   # was 256
 parser.add_argument("--n_heads",       type=int,   default=4)
 parser.add_argument("--e_layers",      type=int,   default=2)
-parser.add_argument("--d_ff",          type=int,   default=512)
-parser.add_argument("--dropout",       type=float, default=0.1)
+parser.add_argument("--d_ff",          type=int,   default=256)   # was 512
+parser.add_argument("--dropout",       type=float, default=0.2)   # was 0.1
 parser.add_argument("--mlp_hidden",    type=int,   default=64)
 parser.add_argument("--class_strategy", default="mean")   # mean / cls_token
+parser.add_argument("--head_type", default="gate", choices=["gate", "mean", "cls"],
+                    help="pooling 方式。gate=可学习因子权重(默认)，mean=旧行为，cls=CLS token")
 parser.add_argument("--embed",  default="fixed")
 parser.add_argument("--freq",   default="b")
 parser.add_argument("--factor", type=int, default=1)
@@ -64,6 +66,7 @@ parser.add_argument("--output_attention", action="store_true")
 parser.add_argument("--epochs",        type=int,   default=20)
 parser.add_argument("--batch_size",    type=int,   default=512)
 parser.add_argument("--lr",            type=float, default=1e-4)
+parser.add_argument("--weight_decay",  type=float, default=1e-2)
 parser.add_argument("--patience",      type=int,   default=5)
 parser.add_argument("--num_workers",   type=int,   default=4)
 parser.add_argument("--loss",          default="combined",  help="mse / rankic / combined")
@@ -137,7 +140,18 @@ model = Model(args).to(device)
 n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Model params: {n_params:,}  |  Features: {args.enc_in}")
 
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+decay, no_decay = [], []
+for n_, p_ in model.named_parameters():
+    if not p_.requires_grad:
+        continue
+    if p_.ndim <= 1 or "variate_emb" in n_ or "gate" in n_:
+        no_decay.append(p_)
+    else:
+        decay.append(p_)
+optimizer = torch.optim.AdamW(
+    [{"params": decay,    "weight_decay": args.weight_decay},
+     {"params": no_decay, "weight_decay": 0.0}],
+    lr=args.lr)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
 
@@ -176,11 +190,15 @@ def compute_loss(pred, target, mode: str, ic_weight: float) -> torch.Tensor:
                  此时 MSE~0.003，|IC|~0.05，ic_weight≈0.05 使两项量级相当
                  label 改用 ret_5d_open_cs_rank [0,1] 时 MSE~0.08，ic_weight 需重新校准至~1
     """
+    pred   = pred.reshape(-1)
+    target = target.reshape(-1)
+    assert pred.shape == target.shape, (pred.shape, target.shape)
+
     if mode == "rankic":
         return neg_pearson(pred, target)
     elif mode == "combined":
         return mse_loss_fn(pred, target) + ic_weight * neg_pearson(pred, target)
-    else:  # mse
+    else:
         return mse_loss_fn(pred, target)
 
 
@@ -256,7 +274,13 @@ for epoch in range(1, args.epochs + 1):
     if not np.isnan(val_rankic) and val_rankic > best_val_ic:
         best_val_ic = val_rankic
         patience_cnt = 0
-        torch.save({"state_dict": model.state_dict(), "args": vars(args)}, best_ckpt)
+        torch.save({
+            "state_dict":   model.state_dict(),
+            "args":         vars(args),
+            "feature_cols": list(train_ds.feature_cols),
+            "enc_in":       args.enc_in,
+        }, best_ckpt)
+
         print(f"  -> Best model saved (val_RankIC={val_rankic:.4f})")
     else:
         patience_cnt += 1

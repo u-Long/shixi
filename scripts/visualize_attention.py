@@ -57,11 +57,17 @@ def load_model(ckpt_path, cfg_path):
     # 默认补全
     defaults = dict(
         factor=1, activation="gelu", embed="fixed", freq="b",
-        dropout=0.1, mlp_hidden=64, class_strategy="mean",
+        dropout=0.1, mlp_hidden=64, class_strategy="mean", head_type="gate",
         output_attention=True,       # 强制开启
     )
     defaults.update(args_dict)
     defaults["output_attention"] = True  # 覆盖确保开启
+
+    # enc_in 必须从 cache 里读，否则 Model 构造时维度对不上
+    cache_dir = os.path.join(ROOT, defaults.get("cache_dir", ""))
+    col_file = os.path.join(cache_dir, "feature_cols.npy")
+    if os.path.exists(col_file):
+        defaults["enc_in"] = len(np.load(col_file, allow_pickle=True))
     cfg = SimpleNamespace(**defaults)
 
     model = Model(cfg)
@@ -70,7 +76,11 @@ def load_model(ckpt_path, cfg_path):
         state = state["model_state_dict"]
     elif isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
-    model.load_state_dict(state, strict=False)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[WARN] 未加载（将用初始值）: {missing}")
+    if unexpected:
+        print(f"[WARN] ckpt 中多余的键: {unexpected}")
     model.eval()
     return model, cfg
 

@@ -47,11 +47,12 @@ from scipy.stats import spearmanr, pearsonr
 from torch.utils.data import DataLoader
 
 from data_provider.stock_dataset import StockDataset, DayBatchSampler
-from model.iTransformer_stock import Model
+import importlib
 
 # ── 参数 ────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument("--ckpt",        default="checkpoints/stock/best.pt")
+parser.add_argument("--model",       default=None, help="model 模块名，默认从 ckpt 的 args 里读，读不到则用 iTransformer_stock")
 parser.add_argument("--cache_dir",   default="data/cache/cache_fea2_hs300_ret5do")
 parser.add_argument("--label_lib",   default="data/feature_lib/label_lib.parquet")
 parser.add_argument("--seq_len",     type=int,   default=30)
@@ -72,6 +73,8 @@ parser.add_argument("--d_ff",        type=int,   default=512)
 parser.add_argument("--dropout",     type=float, default=0.0)
 parser.add_argument("--mlp_hidden",  type=int,   default=64)
 parser.add_argument("--class_strategy", default="mean")
+parser.add_argument("--head_type",       default="gate", choices=["gate", "mean", "cls"],
+                    help="pooling 方式，从 ckpt 自动恢复")
 parser.add_argument("--embed",       default="fixed")
 parser.add_argument("--freq",        default="b")
 parser.add_argument("--factor",      type=int,   default=1)
@@ -113,9 +116,12 @@ if args.pred_parquet is None:
                   "train_start", "train_end", "val_start", "val_end",
                   "test_start", "test_end", "train_ratio", "val_ratio",
                   "d_model", "n_heads", "e_layers", "d_ff", "mlp_hidden",
-                  "class_strategy", "embed", "freq", "factor", "activation"]:
+                  "class_strategy", "head_type", "embed", "freq", "factor", "activation"]:
             if k in saved:
                 setattr(args, k, saved[k])
+        # 如果命令行没有指定 --model，从 ckpt 里恢复
+        if args.model is None and "model" in saved:
+            args.model = saved["model"]
         print(f"[backtest] Restored from ckpt: seq_len={args.seq_len}  "
               f"horizon={args.horizon}  test={args.test_start}~{args.test_end}")
 
@@ -191,7 +197,16 @@ else:
 
     # ── 加载模型 & 推理 ───────────────────────────────────────────────────────
     args.enc_in = test_ds.n_features
+    _model_name = args.model if args.model else "iTransformer_stock"
+    Model = importlib.import_module(f"model.{_model_name}").Model
     model = Model(args).to(device)
+    if "feature_cols" in raw_ckpt:
+        ck_cols = list(raw_ckpt["feature_cols"])
+        ds_cols = list(test_ds.feature_cols)
+        assert ck_cols == ds_cols, (
+            f"特征列与训练时不一致，variate_emb 会错位。\n"
+            f"  ckpt 有而 cache 无: {set(ck_cols) - set(ds_cols)}\n"
+            f"  cache 有而 ckpt 无: {set(ds_cols) - set(ck_cols)}")
     model.load_state_dict(raw_ckpt["state_dict"] if "state_dict" in raw_ckpt else raw_ckpt)
     model.eval()
     print(f"Loaded: {args.ckpt}  features={args.enc_in}")
@@ -234,8 +249,8 @@ else:
     df = df.merge(lib, on=["date", "stock"], how="left")
     n_miss = df["o2o"].isna().sum()
     if n_miss:
-        print(f"  [WARN] {n_miss}/{len(df)} 条记录无 o2o，填 0")
-    df["o2o"] = df["o2o"].fillna(0.0)
+        print(f"  [WARN] {n_miss}/{len(df)} 条无 o2o（退市/停牌），剔除而非填 0")
+    df = df.dropna(subset=["o2o"]).reset_index(drop=True)
     df.to_parquet(os.path.join(args.out_dir, "pred_detail.parquet"))
     print(f"  o2o: mean={df['o2o'].mean():.5f}  std={df['o2o'].std():.4f}  "
           f"NaN={n_miss/len(df):.2%}")
@@ -689,16 +704,20 @@ for date, grp in df.groupby("date"):
     if len(grp) < args.n_groups * 2:
         continue
     grp = grp.sort_values("pred", ascending=False).reset_index(drop=True)
-    n   = len(grp)
+    n = len(grp)
     for g in range(args.n_groups):
-        lo = int(g * n / args.n_groups)
-        hi = int((g + 1) * n / args.n_groups)
+        lo, hi = int(g * n / args.n_groups), int((g + 1) * n / args.n_groups)
         group_rets[g].append(grp.iloc[lo:hi]["o2o"].mean())
-    nl = min(BASELINE_TOPK, n // 4)
+
+    # 多空只在可交易样本上取，且明确这是「上限」而非可实现收益
+    tradable = grp[grp["buyable"]] if "buyable" in grp.columns else grp
+    if len(tradable) < 2 * BASELINE_TOPK:
+        continue
+    nl = min(BASELINE_TOPK, len(tradable) // 4)
     ls_rows.append({
         "date":      date,
-        "long_ret":  grp.iloc[:nl]["o2o"].mean(),
-        "short_ret": grp.iloc[-nl:]["o2o"].mean(),
+        "long_ret":  tradable.iloc[:nl]["o2o"].mean(),
+        "short_ret": tradable.iloc[-nl:]["o2o"].mean(),
     })
 
 ls_df = pd.DataFrame(ls_rows).set_index("date")
@@ -776,7 +795,7 @@ cum_long = (1 + ls_df["long_ret"]).cumprod()
 ax.plot(cum_ls.index,   cum_ls.values,   label="Long-Short", color="darkred", lw=1.5)
 ax.plot(cum_long.index, cum_long.values, label="Long Only",  color="olive",   lw=1.0, alpha=0.7)
 ax.axhline(1, color="gray", lw=0.8, ls=":")
-ax.set_title("因子层多空净值（o2o 结算，无成本）")
+ax.set_title("因子层多空净值（o2o，无成本、无冲击 —— 仅作单调性诊断，非可实现收益）")
 ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
 # 4. 日度 RankIC
