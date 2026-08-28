@@ -38,11 +38,15 @@ parser.add_argument("--val_end",     default="2025-04-23")
 parser.add_argument("--test_start",  default="2025-04-24")
 parser.add_argument("--test_end",    default="2026-08-14")
 parser.add_argument("--nan_thresh",  type=float, default=0.3)
+parser.add_argument("--feat_win",    type=int,   default=30,
+                    help="有效性判定窗口，必须等于 iTransformer 的 seq_len，否则股票池不一致")
 # 透传给 backtest.py 的参数
 parser.add_argument("--topk",        type=int,   default=None)
 parser.add_argument("--n_drop",      type=int,   default=None)
 parser.add_argument("--horizon",     type=int,   default=5)
 parser.add_argument("--benchmark",   default="/root/dmd/BaoStock/Index/sh.000001.csv")
+parser.add_argument("--slippage_bps", type=float, default=0.0)
+parser.add_argument("--weight_mode",  default="drift", choices=["drift", "equal"])
 args = parser.parse_args()
 
 os.makedirs(args.out_dir, exist_ok=True)
@@ -55,29 +59,47 @@ dates     = np.load(os.path.join(args.cache_dir, "dates.npy"),     allow_pickle=
 stocks    = np.load(os.path.join(args.cache_dir, "stocks.npy"),    allow_pickle=True)
 feat_cols = np.load(os.path.join(args.cache_dir, "feature_cols.npy"), allow_pickle=True)
 
+univ_path = os.path.join(args.cache_dir, "universe_mask.npy")
+UNIV = np.load(univ_path, mmap_mode="r") if os.path.exists(univ_path) else None
+
 dates_pd = pd.to_datetime(dates)
 T, S, F  = feat_arr.shape
 seq      = args.seq_len
-print(f"T={T}, S={S}, F={F}, seq_len={seq}")
+MIN_DI   = max(seq, args.feat_win) - 1
+EMB      = args.horizon + 1
+print(f"T={T}, S={S}, F={F}, seq_len={seq}, feat_win={args.feat_win}")
+print(f"universe_mask: {'loaded, coverage=%.3f' % UNIV.mean() if UNIV is not None else 'none (全市场)'}")
 
-def date_range_idx(start, end):
+
+def date_range_idx(start, end, embargo_to=None):
     s, e = pd.Timestamp(start), pd.Timestamp(end)
-    return np.where((dates_pd >= s) & (dates_pd <= e))[0]
+    idx = np.where((dates_pd >= s) & (dates_pd <= e))[0]
+    idx = idx[idx >= MIN_DI]
+    if embargo_to is not None:
+        lim = pd.Timestamp(embargo_to)
+        idx = np.array([i for i in idx if dates_pd[min(i + EMB, T - 1)] < lim], dtype=int)
+    return idx
 
-train_idx = date_range_idx(args.train_start, args.train_end)
-val_idx   = date_range_idx(args.val_start,   args.val_end)
+
+train_idx = date_range_idx(args.train_start, args.train_end, args.val_start)
+val_idx   = date_range_idx(args.val_start,   args.val_end,   args.test_start)
 test_idx  = date_range_idx(args.test_start,  args.test_end)
-print(f"Train={len(train_idx)} Val={len(val_idx)} Test={len(test_idx)} days")
+print(f"Days after embargo(span={EMB}) — Train={len(train_idx)} Val={len(val_idx)} Test={len(test_idx)}")
 
 
 def get_features(di):
-    """返回 (S, seq*F) 矩阵和有效 mask"""
-    if di < seq:
+    """返回 (S, seq*F) 矩阵和有效 mask，口径对齐 StockDataset。"""
+    if di < MIN_DI:
         return None, None
-    window = feat_arr[di - seq + 1: di + 1, :, :]   # (seq, S, F)
-    x = window.transpose(1, 0, 2).reshape(S, -1).copy().astype(np.float32)
-    nan_ratio = np.isnan(x).mean(axis=1)
+    # 有效性用 feat_win 判定（对齐 iTransformer 的 seq_len）
+    chk = feat_arr[di - args.feat_win + 1: di + 1, :, :]   # (feat_win, S, F)
+    nan_ratio = np.isnan(chk).mean(axis=(0, 2))             # (S,)
     valid = nan_ratio <= args.nan_thresh
+    if UNIV is not None:
+        valid = valid & np.asarray(UNIV[di, :], dtype=bool)
+    # 特征仍只取 seq_len 天
+    window = feat_arr[di - seq + 1: di + 1, :, :]           # (seq, S, F)
+    x = window.transpose(1, 0, 2).reshape(S, -1).copy().astype(np.float32)
     x = np.nan_to_num(x, nan=0.0)
     return x, valid
 
@@ -159,8 +181,8 @@ test_df["date"] = pd.to_datetime(test_df["date"])
 test_df = test_df.merge(lib, on=["date", "stock"], how="left")
 n_miss = test_df["o2o"].isna().sum()
 if n_miss:
-    print(f"  [WARN] {n_miss} 条记录无 o2o，填 0")
-test_df["o2o"] = test_df["o2o"].fillna(0.0)
+    print(f"  [WARN] {n_miss}/{len(test_df)} 条无 o2o（退市/停牌），剔除而非填 0")
+test_df = test_df.dropna(subset=["o2o"]).reset_index(drop=True)
 
 pred_path = os.path.join(args.out_dir, "pred_detail.parquet")
 test_df.to_parquet(pred_path, index=False)
@@ -181,7 +203,9 @@ cmd = [
     "--train_end",     args.train_end,
     "--val_start",     args.val_start,
     "--val_end",       args.val_end,
-    "--benchmark",     args.benchmark,
+    "--benchmark",      args.benchmark,
+    "--slippage_bps",   str(args.slippage_bps),
+    "--weight_mode",    args.weight_mode,
 ]
 if args.topk is not None:
     cmd += ["--topk", str(args.topk)]
