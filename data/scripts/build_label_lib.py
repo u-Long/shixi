@@ -12,9 +12,11 @@ Label 列表:
   ret_10d_open     — log(open_{t+11}/open_{t+1})         data_utils 风格（开开）
   ret_5d_open      — log(open_{t+6}/open_{t+1})
   ret_1d_open      — log(open_{t+2}/open_{t+1})
+  ret_5d_simo2o    — open_{t+6}/open_{t+1} - 1              简单收益率（非 log）
   ret_5d_avg_open  — 未来5个交易日每日 O2O 收益率的算术平均
                      即 mean( open_{t+2}/open_{t+1}-1, ..., open_{t+6}/open_{t+5}-1 )
-  ret_10d_cs_rank  — ret_10d_log 的截面百分位 rank [0,1]
+  {col}_cs_rank    — 各 label 的截面百分位 rank [0,1]
+  {col}_cs_zscore  — 各 label 的截面 z-score（减均值除标准差）
   excess_10d       — ret_10d_log 减去当日市场平均（超额）
   direction_10d    — ret_10d_log > 0 的二分类标签 {0,1}
   vol_10d          — 未来10日日收益率标准差（波动预测）
@@ -68,6 +70,9 @@ def calc_labels(g):
     l["ret_5d_open"]  = np.log((open_.shift(-6)  / open_.shift(-1)).clip(lower=1e-8))
     l["ret_10d_open"] = np.log((open_.shift(-11) / open_.shift(-1)).clip(lower=1e-8))
 
+    # simple return（非 log），open_{t+6}/open_{t+1} - 1
+    l["ret_5d_simo2o"] = open_.shift(-6) / open_.shift(-1) - 1
+
     # 5日内每日 O2O 收益率的算术均值
     # 第 k 日：open_{t+k+1}/open_{t+k} - 1，k=1..5
     daily_o2o = pd.concat(
@@ -92,8 +97,15 @@ labels = labels.replace([np.inf, -np.inf], np.nan)
 # 截面百分位 rank [0,1]，全 universe 上离线计算，不依赖 DataLoader 截面完整性
 # 用作 rankic/combined loss 的 target 时，neg_pearson 对线性变换不变，直接用 [0,1] 即可
 print("Computing cross-sectional rank labels ...")
-for col in ["ret_10d_log", "ret_5d_log", "ret_5d_open", "ret_10d_open", "ret_5d_avg_open"]:
+for col in ["ret_10d_log", "ret_5d_log", "ret_5d_open", "ret_10d_open", "ret_5d_avg_open", "ret_5d_simo2o"]:
     labels[f"{col}_cs_rank"] = labels[col].groupby(level="datetime").rank(pct=True)
+
+# 截面 z-score 归一化：每日截面减均值除标准差
+print("Computing cross-sectional z-score labels ...")
+for col in ["ret_10d_log", "ret_5d_log", "ret_5d_open", "ret_10d_open", "ret_5d_avg_open", "ret_5d_simo2o"]:
+    labels[f"{col}_cs_zscore"] = labels[col].groupby(level="datetime").transform(
+        lambda x: (x - x.mean()) / (x.std() + 1e-8)
+    )
 
 # 超额收益（减去当日截面均值）
 print("Computing excess return label ...")

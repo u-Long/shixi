@@ -109,7 +109,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 if args.pred_parquet is None:
     # ── 从 checkpoint 恢复训练参数 ────────────────────────────────────────────
-    raw_ckpt = torch.load(args.ckpt, map_location="cpu")
+    raw_ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     if isinstance(raw_ckpt, dict) and "args" in raw_ckpt:
         saved = raw_ckpt["args"]
         for k in ["seq_len", "horizon",
@@ -251,8 +251,10 @@ else:
     if n_miss:
         print(f"  [WARN] {n_miss}/{len(df)} 条无 o2o（退市/停牌），剔除而非填 0")
     df = df.dropna(subset=["o2o"]).reset_index(drop=True)
+    # simple return = exp(log_return) - 1，不重复读 parquet
+    df["o2o_simple"] = np.expm1(df["o2o"])
     df.to_parquet(os.path.join(args.out_dir, "pred_detail.parquet"))
-    print(f"  o2o: mean={df['o2o'].mean():.5f}  std={df['o2o'].std():.4f}  "
+    print(f"  o2o(log): mean={df['o2o'].mean():.5f}  std={df['o2o'].std():.4f}  "
           f"NaN={n_miss/len(df):.2%}")
 
 # ── 构建 buyable / sellable ───────────────────────────────────────────────
@@ -374,6 +376,8 @@ print(f"  显著性请看 t_NW（|t|>2 才算有信号），不要用含重叠�
 
 # ── o2o IC（与回测结算口径绑定，T+1开盘买入T+2开盘卖出的日度收益）────────────
 # 用 ret_1d_open 而非模型训练 label，不依赖 cache 种类，所有模型横向可比
+# o2o     = log return（ret_1d_open = log(open_{t+2}/open_{t+1})）
+# o2o_simple = exp(o2o) - 1 = open_{t+2}/open_{t+1} - 1（simple return）
 o2o_ic_rows = []
 for date, grp in df.groupby("date"):
     if len(grp) < 10:
@@ -382,25 +386,72 @@ for date, grp in df.groupby("date"):
     if valid.sum() < 10:
         continue
     g = grp[valid]
-    ic_v,  _ = pearsonr(g["pred"],  g["o2o"])
-    ric_v, _ = spearmanr(g["pred"], g["o2o"])
-    if not np.isnan(ic_v + ric_v):
-        o2o_ic_rows.append({"date": date, "ic": float(ic_v), "rankic": float(ric_v)})
+    ic_log,   _ = pearsonr(g["pred"],  g["o2o"])
+    ric_log,  _ = spearmanr(g["pred"], g["o2o"])
+    ic_sim,   _ = pearsonr(g["pred"],  g["o2o_simple"])
+    ric_sim,  _ = spearmanr(g["pred"], g["o2o_simple"])
+    if not np.isnan(ic_log + ric_log):
+        o2o_ic_rows.append({
+            "date":        date,
+            "ic":          float(ic_log),
+            "rankic":      float(ric_log),
+            "ic_simple":   float(ic_sim),
+            "rankic_simple": float(ric_sim),
+        })
 
-o2o_ic_df      = pd.DataFrame(o2o_ic_rows).set_index("date")
-o2o_mean_ic     = o2o_ic_df["ic"].mean()     if len(o2o_ic_df) else float("nan")
-o2o_mean_rankic = o2o_ic_df["rankic"].mean() if len(o2o_ic_df) else float("nan")
-o2o_icir        = o2o_mean_ic     / (o2o_ic_df["ic"].std()     + 1e-8) if len(o2o_ic_df) > 1 else float("nan")
-o2o_rankicir    = o2o_mean_rankic / (o2o_ic_df["rankic"].std() + 1e-8) if len(o2o_ic_df) > 1 else float("nan")
-o2o_ic_pos      = (o2o_ic_df["rankic"] > 0).mean() if len(o2o_ic_df) else float("nan")
-# o2o 无重叠（span=1），t 统计直接用标准公式
-o2o_t_rankic    = newey_west_t(o2o_ic_df["rankic"], lag=0) if len(o2o_ic_df) > 1 else float("nan")
+o2o_ic_df = pd.DataFrame(o2o_ic_rows).set_index("date")
 o2o_ic_df.to_csv(os.path.join(args.out_dir, "o2o_ic_series.csv"))
 
+
+def _o2o_stats(sub: pd.DataFrame):
+    """计算一组 o2o_ic_df 子集的统计指标，返回 dict。"""
+    if len(sub) < 2:
+        nan6 = {"ic": float("nan"), "rankic": float("nan"),
+                "ic_simple": float("nan"), "rankic_simple": float("nan"),
+                "icir": float("nan"), "rankicir": float("nan"),
+                "ic_simple_ir": float("nan"), "rankic_simple_ir": float("nan"),
+                "rankic_pos": float("nan"), "rankic_simple_pos": float("nan"),
+                "t_rankic": float("nan"), "t_rankic_simple": float("nan"),
+                "n": len(sub)}
+        return nan6
+    return {
+        "ic":              sub["ic"].mean(),
+        "rankic":          sub["rankic"].mean(),
+        "ic_simple":       sub["ic_simple"].mean(),
+        "rankic_simple":   sub["rankic_simple"].mean(),
+        "icir":            sub["ic"].mean()     / (sub["ic"].std()     + 1e-8),
+        "rankicir":        sub["rankic"].mean() / (sub["rankic"].std() + 1e-8),
+        "ic_simple_ir":    sub["ic_simple"].mean()   / (sub["ic_simple"].std()   + 1e-8),
+        "rankic_simple_ir": sub["rankic_simple"].mean() / (sub["rankic_simple"].std() + 1e-8),
+        "rankic_pos":        (sub["rankic"] > 0).mean(),
+        "rankic_simple_pos": (sub["rankic_simple"] > 0).mean(),
+        "t_rankic":        newey_west_t(sub["rankic"],        lag=0),
+        "t_rankic_simple": newey_west_t(sub["rankic_simple"], lag=0),
+        "n":               len(sub),
+    }
+
+
+def _print_o2o_block(stats: dict, label: str):
+    print(f"\n  [{label}]  N={stats['n']} 天")
+    print(f"    log_ret :  IC={stats['ic']:.4f}  RankIC={stats['rankic']:.4f}"
+          f"  ICIR={stats['icir']:.4f}  RankICIR={stats['rankicir']:.4f}"
+          f"  RankIC>0={stats['rankic_pos']:.2%}  t_NW={stats['t_rankic']:.2f}")
+    print(f"    simple_ret:  IC={stats['ic_simple']:.4f}  RankIC={stats['rankic_simple']:.4f}"
+          f"  ICIR={stats['ic_simple_ir']:.4f}  RankICIR={stats['rankic_simple_ir']:.4f}"
+          f"  RankIC>0={stats['rankic_simple_pos']:.2%}  t_NW={stats['t_rankic_simple']:.2f}")
+
+
+o2o_ic_df.index = pd.to_datetime(o2o_ic_df.index)
+
+# 构建各 scope 统计（全量 + 逐年），供 print 和 summary.md 共用
+_o2o_by_scope = {"全量": _o2o_stats(o2o_ic_df)}
+for yr in sorted(o2o_ic_df.index.year.unique()):
+    sub = o2o_ic_df[o2o_ic_df.index.year == yr]
+    _o2o_by_scope[str(yr)] = _o2o_stats(sub)
+
 print(f"\n== IC 统计（执行层，基于 ret_1d_open o2o，与回测结算绑定）==")
-print(f"  IC    ={o2o_mean_ic:.4f}   RankIC={o2o_mean_rankic:.4f}   RankIC>0={o2o_ic_pos:.2%}")
-print(f"  ICIR={o2o_icir:.4f}   RankICIR={o2o_rankicir:.4f}   t_NW={o2o_t_rankic:.2f}")
-print(f"  N={len(o2o_ic_df)} 天（无重叠，t_NW 可直接用于显著性判断）")
+for scope, st in _o2o_by_scope.items():
+    _print_o2o_block(st, scope)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -866,14 +917,18 @@ md_lines = [
     f"",
     f"### 执行层 o2o（ret_1d_open，与回测结算绑定，无重叠，横向可比）",
     f"",
-    f"| Metric | Value |",
-    f"|--------|-------|",
-    f"| IC | {o2o_mean_ic:.4f} |",
-    f"| ICIR | {o2o_icir:.4f} |",
-    f"| RankIC | {o2o_mean_rankic:.4f} |",
-    f"| RankICIR | {o2o_rankicir:.4f} |",
-    f"| RankIC > 0 | {o2o_ic_pos:.2%} |",
-    f"| t_NW | {o2o_t_rankic:.2f} |",
+    f"| Scope | GT | IC | RankIC | ICIR | RankICIR | RankIC>0 | t_NW |",
+    f"|-------|-----|-----|--------|------|----------|----------|------|",
+    *[
+        f"| {scope} | log_ret | {st['ic']:.4f} | {st['rankic']:.4f} | "
+        f"{st['icir']:.4f} | {st['rankicir']:.4f} | {st['rankic_pos']:.2%} | {st['t_rankic']:.2f} |"
+        for scope, st in _o2o_by_scope.items()
+    ],
+    *[
+        f"| {scope} | simple_ret | {st['ic_simple']:.4f} | {st['rankic_simple']:.4f} | "
+        f"{st['ic_simple_ir']:.4f} | {st['rankic_simple_ir']:.4f} | {st['rankic_simple_pos']:.2%} | {st['t_rankic_simple']:.2f} |"
+        for scope, st in _o2o_by_scope.items()
+    ],
     f"",
 ]
 

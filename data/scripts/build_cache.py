@@ -60,7 +60,18 @@ parser.add_argument("--tag",        default=None,
 parser.add_argument("--fea2_file",  default=None,
                     help="覆盖 fea2 的 parquet 文件名（如 fea2_price_new_0826.parquet），默认 fea2_price_new.parquet")
 parser.add_argument("--fea3_file",  default=None,
-                    help="覆盖 fea3 的 parquet 文件名（如 fea3_v5_770.parquet），默认 fea3_alpha191.parquet")
+                    help="覆盖 fea3 的 parquet 文件名（如 fea3_v5_770.parquet），默认 fea3_v5_770.parquet")
+parser.add_argument("--fea3_drop",  nargs="*", default=[
+    "MIN10", "MIN20", "MIN30", "LOW0", "KLEN",
+    "llm_refined.shadow_vol_scaled_15",
+    "xcat_vol_chip_high_position_risk_60",
+    "xcat_chip_liq_high_turnover_distribution_60",
+    "big_net_inflow_5d", "big_net_inflow_10d", "big_net_inflow_20d",
+    "xcat_sent_chip_low_accumulation_60",
+], help="加载 fea3 后需要 drop 掉的列（日频模型不适用的因子）")
+parser.add_argument("--label_cs_norm", default=None, choices=["zscore", "rank"],
+                    help="对 label 做截面归一化后再写入 cache。zscore=截面z-score，rank=截面百分位[0,1]。"
+                         "使用 label_lib 中预计算的 {label}_cs_zscore / {label}_cs_rank 列，无额外开销")
 args = parser.parse_args()
 
 # 自动生成 tag（含 universe，全市场时省略）
@@ -82,7 +93,7 @@ end   = pd.Timestamp(args.end_date)
 fea_name_map = {
     "fea1": "fea1_price_basic.parquet",
     "fea2": args.fea2_file if args.fea2_file else "fea2_price_new.parquet",
-    "fea3": args.fea3_file if args.fea3_file else "fea3_alpha191.parquet",
+    "fea3": args.fea3_file if args.fea3_file else "fea3_v5_770.parquet",
 }
 
 feat_dfs, loaded_names = [], []
@@ -97,6 +108,11 @@ for fea in args.fea:
     df.index = df.index.set_levels(
         pd.to_datetime(df.index.get_level_values("datetime").unique()), level="datetime"
     )
+    if fea == "fea3" and args.fea3_drop:
+        to_drop = [c for c in args.fea3_drop if c in df.columns]
+        if to_drop:
+            print(f"  Dropping {len(to_drop)} fea3 cols: {to_drop}")
+            df = df.drop(columns=to_drop)
     feat_dfs.append(df)
     loaded_names.append(fea)   # 与 feat_dfs 严格对齐，跳过的特征集不会让前缀错位
 
@@ -127,8 +143,16 @@ print(f"Feature cols ({len(feat_df.columns)}): {feat_df.columns.tolist()}")
 # ── 加载 label ────────────────────────────────────────────────────────────────
 label_path = os.path.join(args.fea_dir, "label_lib.parquet")
 if os.path.exists(label_path):
-    print(f"Loading label '{args.label}' from {label_path} ...")
-    label_df = pd.read_parquet(label_path, columns=[args.label])
+    # 若指定截面归一化，直接读预计算的 _cs_zscore / _cs_rank 列，避免在 cache 里重算
+    if args.label_cs_norm == "zscore":
+        label_col_to_load = f"{args.label}_cs_zscore"
+    elif args.label_cs_norm == "rank":
+        label_col_to_load = f"{args.label}_cs_rank"
+    else:
+        label_col_to_load = args.label
+    print(f"Loading label '{label_col_to_load}' from {label_path} ...")
+    label_df = pd.read_parquet(label_path, columns=[label_col_to_load])
+    label_df = label_df.rename(columns={label_col_to_load: args.label})
     label_df.index = label_df.index.set_levels(
         pd.to_datetime(label_df.index.get_level_values("datetime").unique()), level="datetime"
     )
@@ -282,6 +306,7 @@ if univ_mask is not None:
 
 meta = {
     "fea": args.fea, "label": args.label,
+    "label_cs_norm": args.label_cs_norm,
     "universe": args.universe,
     "start_date": args.start_date, "end_date": args.end_date,
     "T": T, "S": S, "F": F,
@@ -294,5 +319,6 @@ with open(os.path.join(cache_dir, "meta.json"), "w") as f:
 print(f"\nCache saved -> {cache_dir}/")
 print(f"  feat_arr : {feat_arr.shape}  {feat_arr.nbytes/1e9:.2f} GB")
 print(f"  feat NaN : {meta['feat_nan']:.4f}")
-print(f"  label    : {args.label}  NaN={meta['label_nan']:.4f}")
+norm_str = f" [{args.label_cs_norm}]" if args.label_cs_norm else ""
+print(f"  label    : {args.label}{norm_str}  NaN={meta['label_nan']:.4f}")
 print(f"  universe : {args.universe}")

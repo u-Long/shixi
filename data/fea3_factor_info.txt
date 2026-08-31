@@ -1,0 +1,107 @@
+================================================================================
+fea3 因子库信息（v5_770 去除不适用因子后，共 29 个）
+生成时间: 2026-08-31
+================================================================================
+
+【数据文件】
+  全量源文件:   data/feature_lib/fea3_v5_770.parquet  (41 列)
+  Cache 使用:   build_cache.py 加载时通过 --fea3_drop 在内存中剔除 12 列
+                最终写入 cache 的因子数: 29
+
+【IC 计算方式】
+  指标类型:     RankIC（Spearman 秩相关系数）
+  对标标签:     ret_5d_open（未来5日开盘至开盘收益率，log return）
+  计算区间:     仅用 train 期数据（截止 train_end=2024-04-23，防止前向 bias）
+  计算方法:     对每个截面日（抽样400天）计算因子值与标签的截面 Spearman 相关，
+               取所有有效日均值（每日至少50只股票有效才参与）
+
+【截面归一化】
+  方式:         MAD winsorize（mad_k=5）+ z-score
+  在 build_fea3_v5_770.py 中完成，fea3_v5_770.parquet 存储的已是归一化后的值
+
+================================================================================
+【保留因子（29个）】按 |train RankIC| 降序
+================================================================================
+
+ No.  因子名称                                                          train_IC  build_fea3_selected 中的状态
+----  -----------------------------------------------------------------  --------  ----------------------------
+   1  deep_liq_amount_mean30_over_current_std                           +0.09128  selected（入选 top25）
+   2  llm_refined.amount_mean28_over_ema_amount_std                     +0.08982  selected
+   3  llm_refined.amt_mean30_over_ema5_rkstd30                          +0.08931  selected
+   4  llm_refined.amt_ret_instability                                   +0.08690  selected
+   5  llm_refined.amt_vol_price_confirm                                 +0.08409  selected
+   6  spatial_centrality_correlation                                    +0.07498  selected
+   7  llm_refined.smoothed_cov_rsq_abs                                  +0.07424  selected
+   8  candidate_36f044b2c9                                              +0.07342  selected
+   9  deep_rev_lower_shadow_support_5                                   -0.07264  selected
+  10  QTLD60                                                            +0.06416  selected
+  11  candidate_3c6f6dc3d7                                              +0.06410  selected
+  12  QTLD30                                                            +0.05934  selected
+  13  20260414_182815_003_ts_mean_mul_neg_ema_pct_chg_10_ts_me_fe30d0f2 +0.05282  selected
+  14  llm_refined.ideal_amp_open_state                                  +0.04905  selected
+  15  llm_refined.zscore_amplitude_spread_20                            +0.04785  selected
+  16  xcat_vol_liq_squeeze_release_20                                   +0.04764  selected
+  17  BETA20                                                            -0.04674  selected
+  18  20260410_103503_016_neg_mul_div_delta_ema_close_12_3_ts__2eb898ed +0.04394  selected
+  19  deep_liq_dryup_pressure_5_60                                      +0.04351  selected
+  20  candidate_f3d71d2d10                                              +0.04084  selected
+  21  20260410_124526_003_neg_ts_corr_delta_close_5_delta_ema__9656decd +0.03849  selected
+  22  llm_refined.volume_mean30_over_ema_volume10                       +0.03835  selected
+  23  BETA10                                                            -0.03520  selected
+  24  deep_liq_turnover_direction_balance_20                            -0.03338  selected
+  25  deep_fund_low_valuation_multi                                     +0.03264  selected
+  26  VMA20                                                             +0.02708  dropped_corr（IC 通过，相关性剪枝后超 top25）
+  27  deep_liq_turnover_shock_z_20                                      -0.02702  dropped_corr
+  28  20260413_113002_001_neg_ts_mean_div_slope_ema_pct_chg_10_5a4047b0 +0.02693  dropped_corr
+  29  20260414_182815_008_neg_ts_corr_ema_pct_chg_10_ema_turno_2981ae22 +0.02640  dropped_corr
+
+================================================================================
+【剔除因子（12个）及剔除原因】
+================================================================================
+
+  --- A. IC = NaN（因子值覆盖率极低或计算结果全空，8个）---
+
+ No.  因子名称                                    剔除原因
+----  ------------------------------------------  ----------------------------------------
+   1  MIN10                                        ts_min(low,10)/close，low 字段覆盖缺失
+   2  MIN20                                        ts_min(low,20)/close，同上
+   3  MIN30                                        ts_min(low,30)/close，同上
+   4  LOW0                                         low/close，同上
+   5  KLEN                                         (high-low)/open，同上
+   6  llm_refined.shadow_vol_scaled_15             IC=NaN，因子计算异常
+   7  xcat_vol_chip_high_position_risk_60          IC=NaN，NaN率7.6%
+   8  xcat_chip_liq_high_turnover_distribution_60  IC=NaN，NaN率7.6%
+
+  --- B. IC 极低，无有效预测力（4个）---
+
+ No.  因子名称                            train_IC  剔除原因
+----  ------------------------------------  --------  -------------------
+   1  big_net_inflow_5d                    -0.00654  |IC| < 0.02
+   2  big_net_inflow_10d                   -0.00701  |IC| < 0.02
+   3  big_net_inflow_20d                   -0.00652  |IC| < 0.02
+   4  xcat_sent_chip_low_accumulation_60   -0.01429  |IC| < 0.02
+
+================================================================================
+【统计汇总】
+================================================================================
+
+  fea3_v5_770 总列数:   41
+  剔除:                 12（8个 NaN/低覆盖 + 4个低IC）
+  实际使用:             29
+
+  保留因子 train_IC 分布:
+    最大正 IC:  +0.09128  (deep_liq_amount_mean30_over_current_std)
+    最大负 IC:  -0.07264  (deep_rev_lower_shadow_support_5)
+    |IC| 均值:  ~0.0559
+    负向因子:   BETA20(-0.047), deep_rev_lower_shadow_support_5(-0.073),
+               BETA10(-0.035), deep_liq_turnover_direction_balance_20(-0.033),
+               deep_liq_turnover_shock_z_20(-0.027)
+
+【build_cache 命令参考】
+  python data/scripts/build_cache.py \
+    --fea fea3 \
+    --label ret_5d_simo2o \
+    --label_cs_norm zscore \
+    --tag fea3_ret5simo2o_csnorm
+
+================================================================================

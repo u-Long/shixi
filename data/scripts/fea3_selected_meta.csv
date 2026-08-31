@@ -1,0 +1,42 @@
+factor,train_ic,abs_ic,status,reason
+deep_liq_amount_mean30_over_current_std,0.09128,0.09128,selected,
+llm_refined.amount_mean28_over_ema_amount_std,0.08982,0.08982,selected,
+llm_refined.amt_mean30_over_ema5_rkstd30,0.08931,0.08931,selected,
+llm_refined.amt_ret_instability,0.0869,0.0869,selected,
+llm_refined.amt_vol_price_confirm,0.08409,0.08409,selected,
+spatial_centrality_correlation,0.07498,0.07498,selected,
+llm_refined.smoothed_cov_rsq_abs,0.07424,0.07424,selected,
+candidate_36f044b2c9,0.07342,0.07342,selected,
+deep_rev_lower_shadow_support_5,-0.07264,0.07264,selected,
+QTLD60,0.06416,0.06416,selected,
+candidate_3c6f6dc3d7,0.0641,0.0641,selected,
+QTLD30,0.05934,0.05934,selected,
+20260414_182815_003_ts_mean_mul_neg_ema_pct_chg_10_ts_me_fe30d0f2,0.05282,0.05282,selected,
+llm_refined.ideal_amp_open_state,0.04905,0.04905,selected,
+llm_refined.zscore_amplitude_spread_20,0.04785,0.04785,selected,
+xcat_vol_liq_squeeze_release_20,0.04764,0.04764,selected,
+BETA20,-0.04674,0.04674,selected,
+20260410_103503_016_neg_mul_div_delta_ema_close_12_3_ts__2eb898ed,0.04394,0.04394,selected,
+deep_liq_dryup_pressure_5_60,0.04351,0.04351,selected,
+candidate_f3d71d2d10,0.04084,0.04084,selected,
+20260410_124526_003_neg_ts_corr_delta_close_5_delta_ema__9656decd,0.03849,0.03849,selected,
+llm_refined.volume_mean30_over_ema_volume10,0.03835,0.03835,selected,
+BETA10,-0.0352,0.0352,selected,
+deep_liq_turnover_direction_balance_20,-0.03338,0.03338,selected,
+deep_fund_low_valuation_multi,0.03264,0.03264,selected,
+VMA20,0.02708,0.02708,dropped_corr,over top_k
+deep_liq_turnover_shock_z_20,-0.02702,0.02702,dropped_corr,over top_k
+20260413_113002_001_neg_ts_mean_div_slope_ema_pct_chg_10_5a4047b0,0.02693,0.02693,dropped_corr,over top_k
+20260414_182815_008_neg_ts_corr_ema_pct_chg_10_ema_turno_2981ae22,0.0264,0.0264,dropped_corr,over top_k
+xcat_sent_chip_low_accumulation_60,-0.01429,0.01429,dropped_ic,|IC|=0.0143 < 0.02
+big_net_inflow_10d,-0.00701,0.00701,dropped_ic,|IC|=0.0070 < 0.02
+big_net_inflow_5d,-0.00654,0.00654,dropped_ic,|IC|=0.0065 < 0.02
+big_net_inflow_20d,-0.00652,0.00652,dropped_ic,|IC|=0.0065 < 0.02
+llm_refined.shadow_vol_scaled_15,,,dropped_ic,|IC|=nan < 0.02
+KLEN,,,dropped_ic,|IC|=nan < 0.02
+xcat_vol_chip_high_position_risk_60,,,dropped_ic,|IC|=nan < 0.02
+xcat_chip_liq_high_turnover_distribution_60,,,dropped_ic,|IC|=nan < 0.02
+MIN10,,,dropped_ic,|IC|=nan < 0.02
+LOW0,,,dropped_ic,|IC|=nan < 0.02
+MIN30,,,dropped_ic,|IC|=nan < 0.02
+MIN20,,,dropped_ic,|IC|=nan < 0.02

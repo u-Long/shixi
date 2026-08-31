@@ -25,12 +25,16 @@ sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--cache_dir",   default="data/cache/cache_fea2_ret5do_new")
+parser.add_argument("--cache_dir",   default="data/cache/cache_fea2_ret5davgo")
 parser.add_argument("--label_lib",   default="data/feature_lib/label_lib.parquet")
-parser.add_argument("--out_dir",     default="backtest_results/ridge_fea2")
+parser.add_argument("--out_dir",     default="backtest_results/ridge_fea2_ret5davgo")
 parser.add_argument("--seq_len",     type=int,   default=1,
                     help="回看窗口天数，特征展平为 seq_len*F 维（建议1，等价于截面线性）")
-parser.add_argument("--alpha",       type=float, default=100.0)
+parser.add_argument("--alpha",       type=float, default=1000.0,
+                    help="Ridge 正则系数。linear_baseline.py alpha 搜索结果决定此值")
+parser.add_argument("--y_norm",      choices=["zscore", "demean", "none"], default="zscore",
+                    help="label 每日截面归一化。zscore 对应 iTransformer rankic loss 口径；"
+                         "none 对应 mse loss 口径")
 parser.add_argument("--train_start", default="2018-04-24")
 parser.add_argument("--train_end",   default="2024-04-23")
 parser.add_argument("--val_start",   default="2024-04-24")
@@ -104,8 +108,18 @@ def get_features(di):
     return x, valid
 
 
+def normalize_y(y):
+    """每日截面归一化，对齐 iTransformer 的 IC loss 口径。不影响 spearmanr 评估。"""
+    if args.y_norm == "none":
+        return y
+    y = y - y.mean()
+    if args.y_norm == "zscore":
+        y = y / (y.std() + 1e-8)
+    return y
+
+
 # ── 拟合 Ridge ────────────────────────────────────────────────────────────────
-print(f"\nBuilding train matrix ...")
+print(f"\nBuilding train matrix (y_norm={args.y_norm}) ...")
 X_list, y_list = [], []
 for di in train_idx:
     x, valid = get_features(di)
@@ -116,15 +130,37 @@ for di in train_idx:
     if mask.sum() < 50:
         continue
     X_list.append(x[mask])
-    y_list.append(lbl[mask].astype(np.float32))
+    y_list.append(normalize_y(lbl[mask]).astype(np.float32))
 
 X_train = np.concatenate(X_list)
 y_train = np.concatenate(y_list)
 print(f"Train samples: {len(X_train)}, features: {X_train.shape[1]}")
 
-print(f"Fitting Ridge(alpha={args.alpha}) ...")
-model = Ridge(alpha=args.alpha, fit_intercept=True)
-model.fit(X_train, y_train)
+# ── val 集预构建（alpha 搜索用）────────────────────────────────────────────────
+val_days = []
+for di in val_idx:
+    x, valid = get_features(di)
+    if x is None:
+        continue
+    lbl = label_arr[di, :].copy()
+    mask = valid & ~np.isnan(lbl)
+    if mask.sum() < 50:
+        continue
+    val_days.append((x[mask], lbl[mask].astype(np.float32)))
+
+# ── Alpha 搜索（按 val RankIC 选择）──────────────────────────────────────────
+print("\nAlpha 搜索（按 val RankIC 选择）:")
+alpha_results = {}
+for a in [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]:
+    m = Ridge(alpha=a, fit_intercept=True).fit(X_train, y_train)
+    rics = [spearmanr(m.predict(x), y)[0] for x, y in val_days]
+    rics = np.array([r for r in rics if not np.isnan(r)])
+    alpha_results[a] = (m, rics.mean())
+    print(f"  alpha={a:>8.2f}   val RankIC={rics.mean():+.4f}")
+
+best_alpha = max(alpha_results, key=lambda k: alpha_results[k][1])
+model = alpha_results[best_alpha][0]
+print(f"最优 alpha = {best_alpha}（命令行 --alpha 仅作初始参考，以搜索结果为准）")
 print("Done.")
 
 # 因子权重（seq=1 时直接可读）

@@ -72,8 +72,8 @@ parser.add_argument("--num_workers",   type=int,   default=4)
 parser.add_argument("--loss",          default="combined",  help="mse / rankic / combined")
 parser.add_argument("--ic_weight",    type=float, default=0.05,
                     help="combined loss 的 IC 项权重，需按 label 量纲校准：\n"
-                         "  raw ret_5d_open (std≈0.04): MSE~0.003, |IC|~0.05 → ic_weight≈0.05\n"
-                         "  rank_sym ∈[-1,1]:           MSE~1.0,   |IC|~0.1  → ic_weight≈10")
+                         "  raw ret_5d_open (std≈0.04):        MSE~0.002, |IC|~0.05 → ic_weight≈0.05\n"
+                         "  ret_5d_simo2o_cs_zscore (std≈1,mean=0): MSE~1.0, |IC|~0.1 → ic_weight≈1")
 parser.add_argument("--ckpt_dir",      default="checkpoints/stock")
 parser.add_argument("--model",         default="iTransformer_stock", help="model 模块名，如 iTransformer_stock_1")
 parser.add_argument("--gpu",           type=int, default=None, help="指定 GPU 编号，如 --gpu 1；不传则使用默认 cuda 设备")
@@ -186,9 +186,8 @@ def compute_loss(pred, target, mode: str, ic_weight: float) -> torch.Tensor:
                  注意：训练早期 pred 方差小时梯度不稳，建议配合 mse 使用（combined）
 
       combined — MSELoss + ic_weight × (−Pearson)
-                 label 推荐: ret_5d_open（raw, std≈0.04）
-                 此时 MSE~0.003，|IC|~0.05，ic_weight≈0.05 使两项量级相当
-                 label 改用 ret_5d_open_cs_rank [0,1] 时 MSE~0.08，ic_weight 需重新校准至~1
+                 label 推荐: ret_5d_simo2o_cs_zscore（mean=0, std≈1）
+                 此时 MSE~1.0，|IC|~0.1，ic_weight=1 使两项量级相当
     """
     pred   = pred.reshape(-1)
     target = target.reshape(-1)
@@ -246,6 +245,8 @@ best_ckpt = os.path.join(args.ckpt_dir, "best.pt")
 for epoch in range(1, args.epochs + 1):
     model.train()
     total_loss = 0.0
+    total_mse  = 0.0
+    total_ic   = 0.0
     for step, (x, y) in enumerate(train_loader):
         if epoch == 1 and step == 0:
             print(f"\n[Batch info] x={tuple(x.shape)}  y={tuple(y.shape)}")
@@ -263,12 +264,18 @@ for epoch in range(1, args.epochs + 1):
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         total_loss += loss.item()
+        total_mse  += mse_loss_fn(out.reshape(-1), y.reshape(-1)).item()
+        total_ic   += (-neg_pearson(out, y)).item()
 
     scheduler.step()
     avg_loss = total_loss / len(train_loader)
+    avg_mse  = total_mse  / len(train_loader)
+    avg_ic   = total_ic   / len(train_loader)
     val_mse, val_ic, val_icir, val_rankic, val_rankicir = evaluate(val_loader)
 
-    print(f"Epoch {epoch:03d}  train_loss={avg_loss:.4f}  val_mse={val_mse:.4f}  "
+    print(f"Epoch {epoch:03d}  train_loss={avg_loss:.4f}  "
+          f"(mse={avg_mse:.4f}  ic={avg_ic:.4f})  "
+          f"val_mse={val_mse:.4f}  "
           f"IC={val_ic:.4f}  ICIR={val_icir:.4f}  RankIC={val_rankic:.4f}  RankICIR={val_rankicir:.4f}")
 
     if not np.isnan(val_rankic) and val_rankic > best_val_ic:
@@ -290,7 +297,7 @@ for epoch in range(1, args.epochs + 1):
 
 # ── 测试 ─────────────────────────────────────────────────────────────────────
 print("\nLoading best model for test...")
-ckpt = torch.load(best_ckpt, map_location=device)
+ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
 model.load_state_dict(ckpt["state_dict"] if "state_dict" in ckpt else ckpt)
 test_mse, test_ic, test_icir, test_rankic, test_rankicir = evaluate(test_loader)
 print(f"Test  mse={test_mse:.4f}  IC={test_ic:.4f}  ICIR={test_icir:.4f}  "

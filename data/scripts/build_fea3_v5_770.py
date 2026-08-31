@@ -59,8 +59,10 @@ parser.add_argument("--end_date",     default="2026-08-20")
 parser.add_argument("--panel_path",   default="/root/dmd/BaoStock/panel.parquet")
 parser.add_argument("--baostock_dir", default="/root/dmd/BaoStock/daily")
 parser.add_argument("--yaml_path",
-                    default="/root/dmd_factor_arena/factor_library_extension/catalog/"
-                            "select/from_770_universe/v5_comprehensive_50.yaml")
+                    default="/root/gp_factor_qlib/autofactorsetnew/factor_specs/"
+                            "daily_factor_library_full.yaml")
+parser.add_argument("--out_file",     default=None,
+                    help="输出 parquet 文件名，默认根据 yaml 文件名自动生成")
 parser.add_argument("--out_dir",      default="data/feature_lib")
 parser.add_argument("--norm", choices=["zscore", "rank"], default="zscore",
                     help="截面归一化方式。zscore=MAD winsorize + z-score；rank=截面分位数映射到[-1,1]")
@@ -73,18 +75,24 @@ parser.add_argument("--max_nan_rate", type=float, default=0.5,
 args = parser.parse_args()
 
 os.makedirs(args.out_dir, exist_ok=True)
-OUT_PATH = os.path.join(args.out_dir, "fea3_v5_770.parquet")
+if args.out_file:
+    OUT_PATH = os.path.join(args.out_dir, args.out_file)
+else:
+    yaml_stem = os.path.splitext(os.path.basename(args.yaml_path))[0]
+    OUT_PATH = os.path.join(args.out_dir, f"fea3_{yaml_stem}.parquet")
 start = pd.Timestamp(args.start_date)
 end   = pd.Timestamp(args.end_date)
 EPS = 1e-12
 
-# 跳过所有依赖季报字段的因子（季报频率与日频对不上，信号质量差）
-SKIP_FACTORS = {
-    "deep_fund_growth_consistency",         # profit_growth_qoy, revenue_growth_qoy
-    "deep_fund_growth_profitability_combo", # profit_growth_qoy, roe_ttm
-    "deep_fund_leverage_adjusted_roe",      # roe_ttm, total_liab, total_assets
-    "xcat_fund_liq_quality_capacity",       # roe_ttm, gross_margin, net_margin
-    "xcat_chip_fund_quality_breakout_60",   # roe_ttm, gross_margin, net_margin
+# 自动跳过依赖季报字段或数据源不可用字段的因子
+_QUARTERLY_KW = {
+    'profit_growth', 'revenue_growth', 'roe_ttm', 'total_liab',
+    'total_assets', 'gross_margin', 'net_margin',
+}
+_MISSING_FIELDS = {
+    'current_ratio', 'dividend_per_share', 'eps_ttm', 'industry_code',
+    'lhb_buy_amount', 'lhb_sell_amount', 'north_cum_position',
+    'rating_up_flag', 'roa_ttm', 'total_revenue', 'total_shares', 'pledge_shares',
 }
 
 REWRITE_EXPR = {}
@@ -97,8 +105,29 @@ print(f"Loading factor yaml: {args.yaml_path}")
 with open(args.yaml_path) as f:
     spec = yaml.safe_load(f)
 
-factors = [fac for fac in spec["factors"] if fac["name"] not in SKIP_FACTORS]
-print(f"Factors to compute: {len(factors)} (skipped {len(SKIP_FACTORS)})")
+_FIELD_PAT = re.compile(r"id\((\w+)\)")
+def _should_skip(fac):
+    expr = fac.get("expr", "") or ""
+    fields = set(_FIELD_PAT.findall(expr))
+    if fields & _QUARTERLY_KW:
+        return "quarterly"
+    if fields & _MISSING_FIELDS:
+        return "missing_field"
+    return None
+
+skip_reasons = {}
+factors = []
+for fac in spec["factors"]:
+    reason = _should_skip(fac)
+    if reason:
+        skip_reasons[fac["name"]] = reason
+    else:
+        factors.append(fac)
+
+print(f"Factors to compute: {len(factors)} "
+      f"(skipped {len(skip_reasons)}: "
+      f"{sum(1 for r in skip_reasons.values() if r=='quarterly')} quarterly, "
+      f"{sum(1 for r in skip_reasons.values() if r=='missing_field')} missing_field)")
 
 # 扫描负偏移 —— Ref(x, -n) / Delay(x, -n) 这类是明确的未来函数
 LOOKAHEAD_PAT = re.compile(r"\b(Ref|Delay|Shift)\s*\([^()]*,\s*-\s*\d+", re.IGNORECASE)
@@ -275,16 +304,31 @@ val_fields = load_daily_to_daily(
     args.baostock_dir,
 )
 
+print("Loading margin_detail ...")
+margin_fields = load_daily_to_daily(
+    "margin_detail.csv", "trade_date",
+    {"rzye": "margin_balance",   # 融资余额
+     "rqye": "short_balance"},   # 融券余额
+    args.baostock_dir,
+)
+
+print("Loading pledge_stat ...")
+pledge_fields = load_daily_to_daily(
+    "pledge_stat.csv", "end_date",
+    {"pledge_ratio": "pledge_ratio"},
+    args.baostock_dir,
+)
+
 # ── 覆盖度报告：覆盖率过低的字段，依赖它的因子基本是噪声 ──
-denom = len(panel)
+all_ext = {**mf_fields, **val_fields, **margin_fields, **pledge_fields}
 print("\nExternal field coverage (vs panel rows):")
-for k, v in {**mf_fields, **val_fields}.items():
+for k, v in all_ext.items():
     aligned = v.reindex(panel.index)
     cov = aligned.notna().mean()
     flag = "  <-- LOW" if cov < 0.5 else ""
     print(f"  {k:<20s} coverage={cov:6.2%}  raw_rows={len(v)}{flag}")
 
-for d in (mf_fields, val_fields):
+for d in (mf_fields, val_fields, margin_fields, pledge_fields):
     data_ctx.update(d)
 
 print(f"\ndata_ctx keys: {sorted(data_ctx.keys())}")
